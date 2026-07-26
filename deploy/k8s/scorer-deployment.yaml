@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-scorer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fraud-scorer
+  template:
+    metadata:
+      labels:
+        app: fraud-scorer
+    spec:
+      containers:
+        - name: scorer
+          image: us-central1-docker.pkg.dev/PROJECT_ID/fraud-images/app:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MODEL_GCS_URI
+              value: gs://PROJECT-artifacts/models/champion/model.joblib
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "300Mi"
+            limits:
+              cpu: "500m"
+              memory: "400Mi"

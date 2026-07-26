@@ -1,0 +1,8 @@
+project: fraud_pipeline
+registry: data/registry/registry.db
+provider: local
+offline_store:
+  type: file
+online_store:
+  type: sqlite
+  path: data/registry/online_store.db

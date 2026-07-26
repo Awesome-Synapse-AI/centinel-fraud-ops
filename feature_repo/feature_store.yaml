@@ -1,0 +1,9 @@
+project: fraud_pipeline
+registry: ${FEAST_REGISTRY_PATH}
+provider: gcp
+offline_store:
+  type: bigquery
+  dataset: ${FEAST_BIGQUERY_DATASET}
+online_store:
+  type: datastore
+  project_id: ${GCP_PROJECT_ID}
