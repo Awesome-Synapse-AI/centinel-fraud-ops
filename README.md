@@ -41,16 +41,50 @@ python scripts/04_run_preprocessing_pipeline.py --output-root outputs/preprocess
 python ingest/build_features.py --preprocessed-csv outputs/preprocessing/03_label_corr_filtered.csv --output-dir data/staged/v1
 ```
 
-6. Train a model locally:
+6. Register and materialize Feast features:
+
+```bash
+feast -c feature_repo apply
+feast -c feature_repo materialize-incremental 2026-07-26T00:00:00
+```
+
+7. Train a model locally:
 
 ```bash
 python train/train.py --features data/staged/v1/features.parquet --output outputs/model.joblib
 ```
 
-7. Start the scorer:
+8. Start the scorer:
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
+
+## Feast point-in-time layer
+
+The repo now includes [feature_repo/features.py](/D:/Awesome-Synapse-AI/centinel-fraud-ops/feature_repo/features.py) so Feast is part of the implemented pipeline, not just the plan.
+
+Apply and materialize the feature repo:
+
+```bash
+feast -c feature_repo apply
+feast -c feature_repo materialize-incremental 2026-07-26T00:00:00
+```
+
+Build a point-in-time correct training set from a label spine:
+
+```python
+from feast import FeatureStore
+
+store = FeatureStore(repo_path="feature_repo")
+train_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=[
+        "tx_velocity:txn_count_24h",
+        "tx_velocity:amt_sum_24h",
+        "merchant_risk:merch_fraud_rate_30d",
+    ],
+).to_df()
 ```
 
 ## How `scripts/` fits the plan
