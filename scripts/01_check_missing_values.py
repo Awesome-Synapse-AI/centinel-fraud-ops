@@ -1,14 +1,22 @@
 import argparse
 from pathlib import Path
 
-import pandas as pd
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
-from fraud_data_common import add_common_args, build_base_dataset, ensure_output_paths
+from fraud_data_common import (
+    add_common_args,
+    build_base_dataset_spark,
+    create_spark_session,
+    dataframe_from_records,
+    ensure_output_paths,
+    write_single_csv,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Join the training CSVs with the project defaults and report missing values."
+        description="Join the training CSVs with Spark and report missing values."
     )
     add_common_args(parser)
     parser.add_argument("--output-csv", type=Path, default=Path("outputs/01_joined_train.csv"))
@@ -20,53 +28,96 @@ def main() -> None:
     args = parse_args()
     ensure_output_paths(args.output_csv, args.reports_dir)
 
-    df = build_base_dataset(args.transaction_csv, args.identity_csv, args.join_how, args.sample_rows)
-
-    missing_count = df.isna().sum()
-    missing_report = (
-        pd.DataFrame(
-            {
-                "column": missing_count.index,
-                "missing_rows": missing_count.values,
-                "total_rows": len(df),
-                "missing_percent": missing_count.values / len(df) * 100,
-            }
-        )
-        .query("missing_rows > 0")
-        .sort_values(["missing_rows", "column"], ascending=[False, True])
-        .reset_index(drop=True)
+    spark = create_spark_session(
+        app_name="fraud_missing_values",
+        spark_master=args.spark_master,
+        shuffle_partitions=args.spark_shuffle_partitions,
+        driver_memory=args.spark_driver_memory,
     )
-    missing_report.to_csv(args.reports_dir / "missing_values_by_column.csv", index=False)
 
-    by_label_frames = []
-    for label_value, label_df in df.groupby("isFraud", dropna=False):
-        label_missing = label_df.isna().sum()
-        label_report = pd.DataFrame(
-            {
-                "isFraud": label_value,
-                "column": label_missing.index,
-                "missing_rows": label_missing.values,
-                "group_rows": len(label_df),
-                "missing_percent_in_group": label_missing.values / len(label_df) * 100,
-            }
+    try:
+        df = build_base_dataset_spark(
+            spark,
+            args.transaction_csv,
+            args.identity_csv,
+            args.join_how,
+            args.sample_rows,
         )
-        by_label_frames.append(label_report.query("missing_rows > 0"))
+        total_rows = df.count()
 
-    missing_by_label = (
-        pd.concat(by_label_frames, ignore_index=True)
-        .sort_values(["column", "isFraud"])
-        .reset_index(drop=True)
-    )
-    missing_by_label.to_csv(args.reports_dir / "missing_values_by_isFraud.csv", index=False)
+        missing_exprs = [
+            F.sum(
+                F.when(F.col(column).isNull() | F.isnan(F.col(column).cast("double")), 1).otherwise(0)
+            ).alias(column)
+            for column in df.columns
+        ]
+        missing_row = df.agg(*missing_exprs).collect()[0].asDict()
+        missing_records = [
+            {
+                "column": column,
+                "missing_rows": int(missing_rows),
+                "total_rows": int(total_rows),
+                "missing_percent": float(missing_rows) / total_rows * 100 if total_rows else 0.0,
+            }
+            for column, missing_rows in missing_row.items()
+            if int(missing_rows) > 0
+        ]
+        missing_records.sort(key=lambda row: (-row["missing_rows"], row["column"]))
 
-    df.to_csv(args.output_csv, index=False)
+        missing_schema = T.StructType(
+            [
+                T.StructField("column", T.StringType(), False),
+                T.StructField("missing_rows", T.LongType(), False),
+                T.StructField("total_rows", T.LongType(), False),
+                T.StructField("missing_percent", T.DoubleType(), False),
+            ]
+        )
+        missing_report_df = dataframe_from_records(spark, missing_records, missing_schema)
+        write_single_csv(missing_report_df, args.reports_dir / "missing_values_by_column.csv")
 
-    print(f"Joined rows: {len(df):,}")
-    print(f"Joined columns: {df.shape[1]:,}")
-    print(f"Columns with missing values: {len(missing_report):,}")
-    print(f"Total missing cells: {int(missing_report['missing_rows'].sum()):,}")
-    print(f"Saved joined data: {args.output_csv}")
-    print(f"Saved reports: {args.reports_dir}")
+        label_rows = []
+        for label_value in [0, 1]:
+            label_df = df.filter(F.col("isFraud") == label_value)
+            group_rows = label_df.count()
+            if group_rows == 0:
+                continue
+            label_missing = label_df.agg(*missing_exprs).collect()[0].asDict()
+            for column, missing_rows in label_missing.items():
+                if int(missing_rows) <= 0:
+                    continue
+                label_rows.append(
+                    {
+                        "isFraud": int(label_value),
+                        "column": column,
+                        "missing_rows": int(missing_rows),
+                        "group_rows": int(group_rows),
+                        "missing_percent_in_group": float(missing_rows) / group_rows * 100,
+                    }
+                )
+
+        label_rows.sort(key=lambda row: (row["column"], row["isFraud"]))
+        label_schema = T.StructType(
+            [
+                T.StructField("isFraud", T.IntegerType(), False),
+                T.StructField("column", T.StringType(), False),
+                T.StructField("missing_rows", T.LongType(), False),
+                T.StructField("group_rows", T.LongType(), False),
+                T.StructField("missing_percent_in_group", T.DoubleType(), False),
+            ]
+        )
+        missing_by_label_df = dataframe_from_records(spark, label_rows, label_schema)
+        write_single_csv(missing_by_label_df, args.reports_dir / "missing_values_by_isFraud.csv")
+
+        write_single_csv(df, args.output_csv)
+
+        print(f"Joined rows: {total_rows:,}")
+        print(f"Joined columns: {len(df.columns):,}")
+        print(f"Columns with missing values: {len(missing_records):,}")
+        print(f"Total missing cells: {sum(row['missing_rows'] for row in missing_records):,}")
+        print(f"Saved joined data: {args.output_csv}")
+        print(f"Saved reports: {args.reports_dir}")
+    finally:
+        spark.stop()
 
 
 if __name__ == "__main__":

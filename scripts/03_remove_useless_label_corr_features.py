@@ -1,21 +1,24 @@
 import argparse
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
+from pyspark.sql import types as T
 
 from fraud_data_common import (
     add_common_args,
-    build_base_dataset,
+    build_base_dataset_spark,
+    create_spark_session,
+    dataframe_from_records,
     ensure_output_paths,
-    numeric_feature_columns,
+    label_correlations,
+    numeric_feature_columns_spark,
+    write_single_csv,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Join the training CSVs, check numeric feature correlation with isFraud, "
+            "Join the training CSVs with Spark, check numeric feature correlation with isFraud, "
             "remove weakly correlated numeric features, and save the processed data."
         )
     )
@@ -38,37 +41,60 @@ def main() -> None:
     args = parse_args()
     ensure_output_paths(args.output_csv, args.reports_dir)
 
-    df = build_base_dataset(args.transaction_csv, args.identity_csv, args.join_how, args.sample_rows)
-    numeric_cols = numeric_feature_columns(df)
+    spark = create_spark_session(
+        app_name="fraud_remove_weak_label_corr",
+        spark_master=args.spark_master,
+        shuffle_partitions=args.spark_shuffle_partitions,
+        driver_memory=args.spark_driver_memory,
+    )
 
-    label_corr = df[numeric_cols + ["isFraud"]].corr(method="pearson")["isFraud"]
-    label_corr = label_corr.drop("isFraud", errors="ignore")
-    label_report = (
-        pd.DataFrame(
-            {
-                "feature": label_corr.index,
-                "correlation_with_isFraud": label_corr.values,
-                "abs_correlation": label_corr.abs().fillna(0).values,
-            }
+    try:
+        df = build_base_dataset_spark(
+            spark,
+            args.transaction_csv,
+            args.identity_csv,
+            args.join_how,
+            args.sample_rows,
         )
-        .sort_values("abs_correlation", ascending=False)
-        .reset_index(drop=True)
-    )
-    label_report["decision"] = np.where(
-        label_report["abs_correlation"] < args.label_corr_threshold, "remove", "keep"
-    )
-    label_report.to_csv(args.reports_dir / "feature_label_correlations.csv", index=False)
+        numeric_cols = numeric_feature_columns_spark(df)
+        correlations = label_correlations(df, numeric_cols)
 
-    to_drop = label_report.loc[label_report["decision"] == "remove", "feature"].tolist()
-    processed_df = df.drop(columns=to_drop)
-    processed_df.to_csv(args.output_csv, index=False)
+        label_rows = [
+            {
+                "feature": feature,
+                "correlation_with_isFraud": correlations[feature],
+                "abs_correlation": correlations[feature],
+                "decision": "remove"
+                if correlations[feature] < args.label_corr_threshold
+                else "keep",
+            }
+            for feature in numeric_cols
+        ]
+        label_rows.sort(key=lambda row: row["abs_correlation"], reverse=True)
 
-    print(f"Joined rows: {len(df):,}")
-    print(f"Numeric features checked: {len(numeric_cols):,}")
-    print(f"Removed weak-label-correlation features: {len(to_drop):,}")
-    print(f"Kept columns: {processed_df.shape[1]:,}")
-    print(f"Saved processed data: {args.output_csv}")
-    print(f"Saved reports: {args.reports_dir}")
+        report_schema = T.StructType(
+            [
+                T.StructField("feature", T.StringType(), False),
+                T.StructField("correlation_with_isFraud", T.DoubleType(), False),
+                T.StructField("abs_correlation", T.DoubleType(), False),
+                T.StructField("decision", T.StringType(), False),
+            ]
+        )
+        report_df = dataframe_from_records(spark, label_rows, report_schema)
+        write_single_csv(report_df, args.reports_dir / "feature_label_correlations.csv")
+
+        to_drop = [row["feature"] for row in label_rows if row["decision"] == "remove"]
+        processed_df = df.drop(*to_drop)
+        write_single_csv(processed_df, args.output_csv)
+
+        print(f"Joined rows: {df.count():,}")
+        print(f"Numeric features checked: {len(numeric_cols):,}")
+        print(f"Removed weak-label-correlation features: {len(to_drop):,}")
+        print(f"Kept columns: {len(processed_df.columns):,}")
+        print(f"Saved processed data: {args.output_csv}")
+        print(f"Saved reports: {args.reports_dir}")
+    finally:
+        spark.stop()
 
 
 if __name__ == "__main__":
