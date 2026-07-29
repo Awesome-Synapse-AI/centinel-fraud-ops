@@ -4,6 +4,14 @@ from pathlib import Path
 
 from fraud_data_common import DEFAULT_OUTPUT_ROOT, add_common_args, ensure_output_dir
 
+import os, sys
+
+os.environ["HADOOP_HOME"] = r"C:\hadoop"
+os.environ["hadoop.home.dir"] = r"C:\hadoop"
+os.environ["PATH"] = r"C:\hadoop\bin;" + os.environ["PATH"]
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -18,6 +26,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_OUTPUT_ROOT / "preprocessing",
         help="Root directory for joined data, filtered data, and reports.",
+    )
+    parser.add_argument(
+        "--drop-column-missing-threshold",
+        type=float,
+        default=95.0,
+        help="Drop columns whose missing-value percentage is above this threshold.",
+    )
+    parser.add_argument(
+        "--drop-row-missing-threshold",
+        type=float,
+        default=5.0,
+        help="Drop rows with any missing values when the row-level missing rate is at or below this threshold.",
+    )
+    parser.add_argument(
+        "--numeric-fill-floor",
+        type=float,
+        default=-999.0,
+        help="Fallback numeric fill value; step 1 uses min(this value, feature_min - 1).",
     )
     parser.add_argument("--corr-threshold", type=float, default=0.95)
     parser.add_argument("--label-corr-threshold", type=float, default=0.01)
@@ -49,14 +75,23 @@ def main() -> None:
         identity_csv=args.identity_csv,
         join_how=args.join_how,
         sample_rows=args.sample_rows,
+        spark_master=args.spark_master,
+        spark_shuffle_partitions=args.spark_shuffle_partitions,
+        spark_driver_memory=args.spark_driver_memory,
         output_csv=args.output_root / "01_joined_train.csv",
         reports_dir=args.output_root / "reports_missing",
+        drop_column_missing_threshold=args.drop_column_missing_threshold,
+        drop_row_missing_threshold=args.drop_row_missing_threshold,
+        numeric_fill_floor=args.numeric_fill_floor,
     )
     step2_args = step2.parse_args.__globals__["argparse"].Namespace(
         transaction_csv=args.transaction_csv,
         identity_csv=args.identity_csv,
         join_how=args.join_how,
         sample_rows=args.sample_rows,
+        spark_master=args.spark_master,
+        spark_shuffle_partitions=args.spark_shuffle_partitions,
+        spark_driver_memory=args.spark_driver_memory,
         output_csv=args.output_root / "02_no_high_corr.csv",
         reports_dir=args.output_root / "reports_feature_corr",
         corr_threshold=args.corr_threshold,
@@ -66,6 +101,9 @@ def main() -> None:
         identity_csv=args.identity_csv,
         join_how=args.join_how,
         sample_rows=args.sample_rows,
+        spark_master=args.spark_master,
+        spark_shuffle_partitions=args.spark_shuffle_partitions,
+        spark_driver_memory=args.spark_driver_memory,
         output_csv=args.output_root / "03_label_corr_filtered.csv",
         reports_dir=args.output_root / "reports_label_corr",
         label_corr_threshold=args.label_corr_threshold,

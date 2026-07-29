@@ -1,6 +1,6 @@
 import argparse
 import math
-import shutil
+import shutil, sys
 import tempfile
 from pathlib import Path
 
@@ -11,10 +11,31 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
 
-DEFAULT_TRANSACTION_PATH = Path("dataset/train_transaction.csv")
-DEFAULT_IDENTITY_PATH = Path("dataset/train_identity.csv")
+DEFAULT_TRANSACTION_PATH = Path("../dataset/train_transaction.csv")
+DEFAULT_IDENTITY_PATH = Path("../dataset/train_identity.csv")
 DEFAULT_OUTPUT_ROOT = Path("outputs")
 TRANSACTION_START_SQL = "2017-12-01 00:00:00"
+# IEEE-CIS uses TransactionDT as seconds since an arbitrary reference point,
+# not as a real wall-clock timestamp. We derive a synthetic event timestamp
+# from a fixed anchor only so windowed feature logic has a stable ordering axis.
+CATEGORICAL_COLUMNS = {
+    "ProductCD",
+    "card1",
+    "card2",
+    "card3",
+    "card4",
+    "card5",
+    "card6",
+    "addr1",
+    "addr2",
+    "P_emaildomain",
+    "R_emaildomain",
+    "DeviceType",
+    "DeviceInfo",
+    *{f"M{i}" for i in range(1, 10)},
+    *{f"id_{i}" for i in range(12, 39)},
+}
+TIMEDELTA_COLUMNS = {"TransactionDT", *{f"D{i}" for i in range(1, 16)}}
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -66,11 +87,26 @@ def create_spark_session(
     driver_memory: str = "6g",
 ) -> SparkSession:
     return (
-        SparkSession.builder.appName(app_name)
-        .master(spark_master)
-        .config("spark.sql.shuffle.partitions", str(shuffle_partitions))
-        .config("spark.driver.memory", driver_memory)
-        .getOrCreate()
+        SparkSession.builder
+            .appName(app_name)
+            .master(spark_master)
+            .config(
+                "spark.sql.shuffle.partitions",
+                str(shuffle_partitions),
+            )
+            .config(
+                "spark.driver.memory",
+                driver_memory,
+            )
+            .config(
+                "spark.pyspark.python",
+                sys.executable,
+            )
+            .config(
+                "spark.pyspark.driver.python",
+                sys.executable,
+            )
+            .getOrCreate()
     )
 
 
@@ -108,11 +144,17 @@ def build_base_dataset_spark(
         if "DeviceType" in df.columns
         else F.lit(0)
     )
+    if "TransactionDT" not in df.columns:
+        raise ValueError("Expected TransactionDT column in transaction data.")
     return (
         df.withColumn("has_identity", has_identity_expr)
+        .withColumn("TransactionDT", F.col("TransactionDT").cast("double"))
         .withColumn(
             "ts",
-            F.expr(f"timestamp('{TRANSACTION_START_SQL}') + make_interval(0, 0, 0, 0, 0, 0, TransactionDT)"),
+            F.from_unixtime(
+                F.unix_timestamp(F.lit(TRANSACTION_START_SQL))
+                + F.col("TransactionDT").cast("long")
+            ).cast("timestamp"),
         )
         .withColumn("transaction_date", F.to_date("ts").cast("string"))
     )
@@ -128,12 +170,31 @@ def numeric_feature_columns_spark(df: DataFrame) -> list[str]:
         T.DoubleType,
         T.DecimalType,
     )
-    excluded = {"TransactionID", "isFraud"}
+    excluded = {"TransactionID", "isFraud", "has_identity"}
     return [
         field.name
         for field in df.schema.fields
-        if isinstance(field.dataType, numeric_types) and field.name not in excluded
+        if isinstance(field.dataType, numeric_types)
+        and field.name not in excluded
+        and field.name not in CATEGORICAL_COLUMNS
     ]
+
+
+def is_missing_expr(df: DataFrame, column: str):
+    field = df.schema[column]
+    numeric_types = (
+        T.ByteType,
+        T.ShortType,
+        T.IntegerType,
+        T.LongType,
+        T.FloatType,
+        T.DoubleType,
+        T.DecimalType,
+    )
+    base = F.col(column).isNull()
+    if isinstance(field.dataType, numeric_types):
+        return base | F.isnan(F.col(column).cast("double"))
+    return base
 
 
 def build_time_window_features_spark(df: DataFrame) -> DataFrame:

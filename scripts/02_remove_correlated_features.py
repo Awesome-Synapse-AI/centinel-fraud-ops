@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--corr-threshold",
         type=float,
-        default=0.95,
+        default=0.90,
         help="Absolute Pearson correlation threshold for removing one feature from a pair.",
     )
     return parser.parse_args()
