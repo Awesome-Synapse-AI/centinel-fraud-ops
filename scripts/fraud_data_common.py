@@ -4,6 +4,7 @@ import shutil, sys
 import tempfile
 from pathlib import Path
 
+from pyspark import StorageLevel
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.stat import Correlation
 from pyspark.sql import DataFrame, SparkSession
@@ -69,6 +70,19 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default="6g",
         help="Driver memory to request for local Spark jobs.",
     )
+
+
+def cache_df(df: DataFrame) -> DataFrame:
+    """Persist a DataFrame that will be touched by multiple actions.
+
+    Without this, every .count()/.collect()/.agg()/.write() on a DataFrame
+    built from build_base_dataset_spark() re-triggers the full CSV read,
+    join, and column derivation from scratch, since Spark DataFrames are
+    lazy and nothing is cached by default. Scripts that call multiple
+    actions on the same df (almost all of them) should persist it once
+    right after it's built, and call df.unpersist() when done with it.
+    """
+    return df.persist(StorageLevel.MEMORY_AND_DISK)
 
 
 def ensure_output_dir(path: Path) -> None:
@@ -200,22 +214,59 @@ def is_missing_expr(df: DataFrame, column: str):
 def build_time_window_features_spark(df: DataFrame) -> DataFrame:
     from pyspark.sql import Window
 
-    required = {"card1", "ProductCD", "TransactionAmt", "TransactionDT", "ts"}
+    required = {"card1", "TransactionAmt", "TransactionDT", "ts"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"Expected columns missing for time-window features: {sorted(missing)}")
 
+    if "TransactionID" not in df.columns:
+        raise ValueError("Expected TransactionID column for feature joins.")
+
+    product_column = None
+    if "ProductCD" in df.columns:
+        product_column = "ProductCD"
+    elif "ProductCD__encoded" in df.columns:
+        product_column = "ProductCD__encoded"
+
     ts_seconds = F.col("ts").cast("long")
     by_card_24h = Window.partitionBy("card1").orderBy(ts_seconds).rangeBetween(-86400, 0)
-    by_product_30d = Window.partitionBy("ProductCD").orderBy(ts_seconds).rangeBetween(-30 * 86400, -1)
 
-    featured = (
-        df.withColumn("txn_count_24h", F.count(F.lit(1)).over(by_card_24h))
-        .withColumn("amt_sum_24h", F.sum("TransactionAmt").over(by_card_24h))
-        .withColumn("distinct_productcd_24h", F.approx_count_distinct("ProductCD").over(by_card_24h))
-        .withColumn("merch_fraud_rate_30d", F.avg("isFraud").over(by_product_30d))
-        .withColumn("merch_volume_30d", F.count(F.lit(1)).over(by_product_30d))
+    # Compute window features on a narrow projection first to reduce shuffle width,
+    # then join the derived columns back to the full dataset.
+    window_select_cols = ["TransactionID", "card1", "TransactionAmt", "isFraud", "ts"]
+    if product_column is not None:
+        window_select_cols.insert(2, product_column)
+
+    window_input = df.select(*window_select_cols)
+    derived_features = window_input.withColumn("txn_count_24h", F.count(F.lit(1)).over(by_card_24h)).withColumn(
+        "amt_sum_24h", F.sum("TransactionAmt").over(by_card_24h)
     )
+
+    if product_column is not None:
+        by_product_30d = Window.partitionBy(product_column).orderBy(ts_seconds).rangeBetween(-30 * 86400, -1)
+        derived_features = (
+            derived_features
+            .withColumn("distinct_productcd_24h", F.approx_count_distinct(product_column).over(by_card_24h))
+            .withColumn("merch_fraud_rate_30d", F.avg("isFraud").over(by_product_30d))
+            .withColumn("merch_volume_30d", F.count(F.lit(1)).over(by_product_30d))
+        )
+    else:
+        derived_features = (
+            derived_features
+            .withColumn("distinct_productcd_24h", F.lit(0))
+            .withColumn("merch_fraud_rate_30d", F.lit(0.0))
+            .withColumn("merch_volume_30d", F.lit(0))
+        )
+
+    derived_features = derived_features.select(
+        "TransactionID",
+        "txn_count_24h",
+        "amt_sum_24h",
+        "distinct_productcd_24h",
+        "merch_fraud_rate_30d",
+        "merch_volume_30d",
+    )
+    featured = df.join(derived_features, on="TransactionID", how="left")
 
     return featured.fillna(
         {
@@ -253,27 +304,59 @@ def safe_abs_correlation(value: float | None) -> float:
     return abs(float(value))
 
 
+def _pearson_matrix(df: DataFrame, columns: list[str]):
+    """Single Spark job computing the full Pearson correlation matrix for `columns`."""
+    vector_df = (
+        df.select(*[F.col(column).cast("double").alias(column) for column in columns])
+        .na.fill(0.0)
+    )
+    assembler = VectorAssembler(inputCols=columns, outputCol="features", handleInvalid="keep")
+    matrix_row = Correlation.corr(assembler.transform(vector_df).select("features"), "features", "pearson").head()
+    return matrix_row[0]
+
+
 def label_correlations(df: DataFrame, numeric_cols: list[str]) -> dict[str, float]:
-    correlations: dict[str, float] = {}
-    cleaned = df.select(
-        *[F.col(column).cast("double").alias(column) for column in numeric_cols],
-        F.col("isFraud").cast("double").alias("isFraud"),
-    ).na.drop(subset=["isFraud"])
-    for column in numeric_cols:
-        corr_value = cleaned.stat.corr(column, "isFraud")
-        correlations[column] = safe_abs_correlation(corr_value)
-    return correlations
+    """Absolute Pearson correlation of each numeric column with isFraud.
+
+    Computed as one Spark job over a single assembled correlation matrix
+    (numeric_cols + isFraud), instead of calling df.stat.corr() once per
+    column, which previously triggered one full-table scan per feature.
+    """
+    if not numeric_cols:
+        return {}
+    matrix = _pearson_matrix(df, [*numeric_cols, "isFraud"])
+    label_idx = len(numeric_cols)
+    return {
+        column: safe_abs_correlation(float(matrix[i, label_idx]))
+        for i, column in enumerate(numeric_cols)
+    }
 
 
 def correlation_matrix(df: DataFrame, numeric_cols: list[str]) -> list[list[float]]:
     if not numeric_cols:
         return []
-    vector_df = (
-        df.select(*[F.col(column).cast("double").alias(column) for column in numeric_cols])
-        .na.fill(0.0)
-    )
-    assembler = VectorAssembler(inputCols=numeric_cols, outputCol="features", handleInvalid="keep")
-    matrix_row = Correlation.corr(assembler.transform(vector_df).select("features"), "features", "pearson").head()
-    matrix = matrix_row[0]
+    matrix = _pearson_matrix(df, numeric_cols)
     size = len(numeric_cols)
     return [[float(matrix[i, j]) for j in range(size)] for i in range(size)]
+
+
+def correlation_matrix_with_label(
+    df: DataFrame, numeric_cols: list[str]
+) -> tuple[list[list[float]], dict[str, float]]:
+    """Pairwise correlation matrix AND correlation-with-label in a single pass.
+
+    Callers that need both correlation_matrix(...) and label_correlations(...)
+    on the same numeric_cols (e.g. the high-correlation pruning step) should
+    use this instead of calling both separately, since that would otherwise
+    assemble the feature vector and run Correlation.corr twice.
+    """
+    if not numeric_cols:
+        return [], {}
+    matrix = _pearson_matrix(df, [*numeric_cols, "isFraud"])
+    size = len(numeric_cols)
+    pairwise = [[float(matrix[i, j]) for j in range(size)] for i in range(size)]
+    label_corr = {
+        column: safe_abs_correlation(float(matrix[i, size]))
+        for i, column in enumerate(numeric_cols)
+    }
+    return pairwise, label_corr

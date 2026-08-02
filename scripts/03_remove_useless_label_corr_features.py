@@ -6,6 +6,7 @@ from pyspark.sql import types as T
 from fraud_data_common import (
     add_common_args,
     build_base_dataset_spark,
+    cache_df,
     create_spark_session,
     dataframe_from_records,
     ensure_output_paths,
@@ -56,6 +57,8 @@ def main() -> None:
             args.join_how,
             args.sample_rows,
         )
+        # df feeds label_correlations, the row count, and the final write.
+        df = cache_df(df)
         numeric_cols = numeric_feature_columns_spark(df)
         correlations = label_correlations(df, numeric_cols)
 
@@ -93,6 +96,7 @@ def main() -> None:
         print(f"Kept columns: {len(processed_df.columns):,}")
         print(f"Saved processed data: {args.output_csv}")
         print(f"Saved reports: {args.reports_dir}")
+        df.unpersist()
     finally:
         spark.stop()
 

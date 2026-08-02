@@ -4,8 +4,7 @@ import sys
 from pathlib import Path
 
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import OneHotEncoder, StringIndexer
-from pyspark.ml.functions import vector_to_array
+from pyspark.ml.feature import StringIndexer
 from pyspark.sql import DataFrame, functions as F
 from pyspark.sql import types as T
 
@@ -13,7 +12,8 @@ from fraud_data_common import (
     DEFAULT_OUTPUT_ROOT,
     add_common_args,
     build_base_dataset_spark,
-    correlation_matrix,
+    cache_df,
+    correlation_matrix_with_label,
     create_spark_session,
     dataframe_from_records,
     ensure_output_dir,
@@ -91,8 +91,13 @@ def _write_stage_if_missing(path: Path, builder) -> None:
     builder()
 
 
-def _sanitize_feature_suffix(value: str) -> str:
-    return "".join(character if character.isalnum() else "_" for character in value).strip("_") or "value"
+def _normalize_column_names(df: DataFrame) -> DataFrame:
+    normalized_df = df
+    for column in df.columns:
+        normalized_column = column.replace("-", "_")
+        if normalized_column != column:
+            normalized_df = normalized_df.withColumnRenamed(column, normalized_column)
+    return normalized_df
 
 
 def run_step1(args: argparse.Namespace, spark, output_csv: Path, reports_dir: Path) -> None:
@@ -104,13 +109,16 @@ def run_step1(args: argparse.Namespace, spark, output_csv: Path, reports_dir: Pa
         args.join_how,
         args.sample_rows,
     )
-    total_rows = df.count()
+    # df feeds many actions below; cache it once instead of re-reading and
+    # re-joining the raw CSVs for each count()/agg()/write().
+    df = cache_df(df)
 
-    missing_exprs = [
+    missing_exprs = [F.count(F.lit(1)).alias("__total_rows__")] + [
         F.sum(F.when(is_missing_expr(df, column), 1).otherwise(0)).alias(column)
         for column in df.columns
     ]
     missing_row = df.agg(*missing_exprs).collect()[0].asDict()
+    total_rows = int(missing_row.pop("__total_rows__"))
     missing_records = [
         {
             "column": column,
@@ -142,20 +150,32 @@ def run_step1(args: argparse.Namespace, spark, output_csv: Path, reports_dir: Pa
         if row["missing_percent"] > args.drop_column_missing_threshold
     ]
     working_df = df.drop(*columns_to_drop) if columns_to_drop else df
+    # working_df feeds the per-label report, the row-missing filter, the
+    # cleaning step, and the final write below.
+    working_df = cache_df(working_df)
+
+    non_label_columns = [c for c in working_df.columns if c != "isFraud"]
+    label_agg_exprs = [F.count(F.lit(1)).alias("__group_rows__")] + [
+        F.sum(F.when(is_missing_expr(working_df, column), 1).otherwise(0)).alias(column)
+        for column in non_label_columns
+    ]
+    # One groupBy pass instead of filtering + aggregating separately per label.
+    label_grouped_rows = (
+        working_df.filter(F.col("isFraud").isin(0, 1))
+        .groupBy("isFraud")
+        .agg(*label_agg_exprs)
+        .collect()
+    )
 
     label_rows = []
-    for label_value in [0, 1]:
-        label_df = working_df.filter(F.col("isFraud") == label_value)
-        group_rows = label_df.count()
+    for grouped_row in label_grouped_rows:
+        row_dict = grouped_row.asDict()
+        label_value = row_dict.pop("isFraud")
+        group_rows = int(row_dict.pop("__group_rows__"))
         if group_rows == 0:
             continue
-        label_missing_exprs = [
-            F.sum(F.when(is_missing_expr(working_df, column), 1).otherwise(0)).alias(column)
-            for column in working_df.columns
-        ]
-        label_missing = label_df.agg(*label_missing_exprs).collect()[0].asDict()
-        for column, missing_rows in label_missing.items():
-            if int(missing_rows) <= 0:
+        for column, missing_rows in row_dict.items():
+            if missing_rows is None or int(missing_rows) <= 0:
                 continue
             label_rows.append(
                 {
@@ -203,17 +223,33 @@ def run_step1(args: argparse.Namespace, spark, output_csv: Path, reports_dir: Pa
             T.DoubleType,
             T.DecimalType,
         )
+        numeric_field_names = [
+            field.name for field in working_df.schema.fields
+            if isinstance(field.dataType, numeric_types)
+        ]
+        non_numeric_field_names = [
+            field.name for field in working_df.schema.fields
+            if field.name not in numeric_field_names
+        ]
+        # Single agg() computes every numeric column's min in one pass,
+        # instead of one .select(F.min(...)).first() job per column.
+        min_row = (
+            working_df.agg(
+                *[F.min(F.col(name).cast("double")).alias(name) for name in numeric_field_names]
+            ).collect()[0].asDict()
+            if numeric_field_names
+            else {}
+        )
         fill_map = {}
-        for field in working_df.schema.fields:
-            if isinstance(field.dataType, numeric_types):
-                min_value = working_df.select(F.min(F.col(field.name).cast("double"))).first()[0]
-                fill_map[field.name] = (
-                    float(args.numeric_fill_floor)
-                    if min_value is None
-                    else float(min(args.numeric_fill_floor, min_value - 1.0))
-                )
-            else:
-                fill_map[field.name] = "__MISSING__"
+        for name in numeric_field_names:
+            min_value = min_row.get(name)
+            fill_map[name] = (
+                float(args.numeric_fill_floor)
+                if min_value is None
+                else float(min(args.numeric_fill_floor, min_value - 1.0))
+            )
+        for name in non_numeric_field_names:
+            fill_map[name] = "__MISSING__"
         cleaned_df = working_df.fillna(fill_map)
         cleaning_strategy = "fillna_sentinel"
 
@@ -244,14 +280,15 @@ def run_step1(args: argparse.Namespace, spark, output_csv: Path, reports_dir: Pa
         reports_dir / "missing_value_cleaning_decisions.csv",
     )
     write_single_csv(cleaned_df, output_csv)
+    working_df.unpersist()
+    df.unpersist()
 
 
 def run_step2(args: argparse.Namespace, spark, input_csv: Path, output_csv: Path, reports_dir: Path) -> None:
     ensure_output_dir(reports_dir)
-    df = _read_csv(spark, input_csv)
+    df = cache_df(_read_csv(spark, input_csv))
     numeric_cols = numeric_feature_columns_spark(df)
-    matrix = correlation_matrix(df, numeric_cols)
-    label_corr = label_correlations(df, numeric_cols)
+    matrix, label_corr = correlation_matrix_with_label(df, numeric_cols)
 
     high_pairs = []
     for i, feature_a in enumerate(numeric_cols):
@@ -322,11 +359,12 @@ def run_step2(args: argparse.Namespace, spark, input_csv: Path, output_csv: Path
         reports_dir / "correlated_feature_removal_decisions.csv",
     )
     write_single_csv(df.drop(*sorted(to_drop)), output_csv)
+    df.unpersist()
 
 
 def run_step3(args: argparse.Namespace, spark, input_csv: Path, output_csv: Path, reports_dir: Path) -> None:
     ensure_output_dir(reports_dir)
-    df = _read_csv(spark, input_csv)
+    df = cache_df(_read_csv(spark, input_csv))
     numeric_cols = numeric_feature_columns_spark(df)
     correlations = label_correlations(df, numeric_cols)
 
@@ -356,6 +394,7 @@ def run_step3(args: argparse.Namespace, spark, input_csv: Path, output_csv: Path
 
     to_drop = [row["feature"] for row in label_rows if row["decision"] == "remove"]
     write_single_csv(df.drop(*to_drop), output_csv)
+    df.unpersist()
 
 
 def _build_test_base_dataset(
@@ -365,8 +404,8 @@ def _build_test_base_dataset(
     join_how: str,
     sample_rows: int | None,
 ) -> DataFrame:
-    transaction_df = _read_csv(spark, transaction_csv)
-    identity_df = _read_csv(spark, identity_csv)
+    transaction_df = _normalize_column_names(_read_csv(spark, transaction_csv))
+    identity_df = _normalize_column_names(_read_csv(spark, identity_csv))
     if sample_rows is not None:
         transaction_df = transaction_df.limit(sample_rows)
         identity_df = identity_df.limit(sample_rows)
@@ -437,67 +476,23 @@ def prepare_final_datasets(
         if test_fill_columns:
             test_model_input = test_model_input.fillna("__MISSING__", subset=test_fill_columns)
 
-        index_columns = [f"{column}__idx" for column in categorical_feature_columns]
-        encoded_columns = [f"{column}__ohe" for column in categorical_feature_columns]
+        encoded_categorical_feature_columns = [f"{column}__encoded" for column in categorical_feature_columns]
         pipeline = Pipeline(
             stages=[
                 StringIndexer(
                     inputCol=column,
-                    outputCol=index_column,
+                    outputCol=encoded_column,
                     handleInvalid="keep",
                 )
-                for column, index_column in zip(categorical_feature_columns, index_columns)
-            ] + [
-                OneHotEncoder(
-                    inputCols=index_columns,
-                    outputCols=encoded_columns,
-                    handleInvalid="keep",
-                )
+                for column, encoded_column in zip(categorical_feature_columns, encoded_categorical_feature_columns)
             ]
         )
         pipeline_model = pipeline.fit(train_model_input)
-        encoded_train = pipeline_model.transform(train_model_input)
-        encoded_test = pipeline_model.transform(test_model_input)
+        train_stage3 = pipeline_model.transform(train_model_input)
+        test_base = pipeline_model.transform(test_model_input)
+    else:
+        encoded_categorical_feature_columns = []
 
-        for column, encoded_column in zip(categorical_feature_columns, encoded_columns):
-            category_values = (
-                encoded_train.select(column)
-                .where(F.col(column).isNotNull())
-                .distinct()
-                .orderBy(column)
-                .rdd.flatMap(lambda row: row)
-                .collect()
-            )
-            # StringIndexer keeps an extra bucket for unseen/null values, which we do not name explicitly.
-            used_output_names: set[str] = set()
-            for idx, category in enumerate(category_values):
-                safe_value = _sanitize_feature_suffix(str(category))
-                output_name = f"{column}__{safe_value}"
-                dedupe_idx = 2
-                while output_name in used_output_names:
-                    output_name = f"{column}__{safe_value}_{dedupe_idx}"
-                    dedupe_idx += 1
-                used_output_names.add(output_name)
-                encoded_train = encoded_train.withColumn(
-                    output_name,
-                    vector_to_array(F.col(encoded_column))[idx],
-                )
-                encoded_test = encoded_test.withColumn(
-                    output_name,
-                    vector_to_array(F.col(encoded_column))[idx],
-                )
-            if len(category_values) == 1:
-                output_name = next(iter(used_output_names))
-                encoded_train = encoded_train.withColumn(output_name, F.lit(0.0))
-                encoded_test = encoded_test.withColumn(output_name, F.lit(0.0))
-        train_stage3 = encoded_train
-        test_base = encoded_test
-
-    encoded_categorical_feature_columns = sorted(
-        column
-        for column in train_stage3.columns
-        if "__" in column and any(column.startswith(f"{source}__") for source in categorical_feature_columns)
-    )
     feature_columns = [*numeric_feature_columns, *encoded_categorical_feature_columns]
     ordered_train_columns = ["isFraud", *feature_columns]
 
@@ -505,6 +500,11 @@ def prepare_final_datasets(
         *[F.col("isFraud").cast("int").alias("isFraud")],
         *[F.col(column).cast("double").alias(column) for column in feature_columns],
     ).fillna(0.0, subset=feature_columns)
+    # Both write_single_csv() and the .count() below are actions on the same
+    # chain (read -> join -> StringIndexer transform -> select); cache once
+    # so the second action reuses the materialized result instead of
+    # recomputing the whole chain from the raw CSVs again.
+    prepared_train = cache_df(prepared_train)
     write_single_csv(prepared_train, final_dir / "train_prepared.csv")
 
     available_test_columns = [column for column in feature_columns if column in test_base.columns]
@@ -515,6 +515,7 @@ def prepare_final_datasets(
     for column in missing_test_columns:
         prepared_test = prepared_test.withColumn(column, F.lit(0.0))
     prepared_test = prepared_test.select(*ordered_train_columns[1:]).fillna(0.0)
+    prepared_test = cache_df(prepared_test)
     write_single_csv(prepared_test, final_dir / "test_prepared.csv")
 
     summary_rows = [
@@ -543,6 +544,8 @@ def prepare_final_datasets(
         dataframe_from_records(spark, summary_rows, summary_schema),
         final_dir / "prepared_dataset_summary.csv",
     )
+    prepared_train.unpersist()
+    prepared_test.unpersist()
 
 
 def main() -> None:

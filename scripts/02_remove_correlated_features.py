@@ -7,11 +7,11 @@ from pyspark.sql import types as T
 from fraud_data_common import (
     add_common_args,
     build_base_dataset_spark,
-    correlation_matrix,
+    cache_df,
+    correlation_matrix_with_label,
     create_spark_session,
     dataframe_from_records,
     ensure_output_paths,
-    label_correlations,
     numeric_feature_columns_spark,
     write_single_csv,
 )
@@ -55,9 +55,12 @@ def main() -> None:
             args.join_how,
             args.sample_rows,
         )
+        # df feeds the correlation computation, the row count, and the final
+        # write below — cache it once instead of re-reading/re-joining the
+        # raw CSVs for each of those actions.
+        df = cache_df(df)
         numeric_cols = numeric_feature_columns_spark(df)
-        matrix = correlation_matrix(df, numeric_cols)
-        label_corr = label_correlations(df, numeric_cols)
+        matrix, label_corr = correlation_matrix_with_label(df, numeric_cols)
 
         high_pairs = []
         for i, feature_a in enumerate(numeric_cols):
@@ -135,6 +138,7 @@ def main() -> None:
         print(f"Kept columns: {len(processed_df.columns):,}")
         print(f"Saved processed data: {args.output_csv}")
         print(f"Saved reports: {args.reports_dir}")
+        df.unpersist()
     finally:
         spark.stop()
 

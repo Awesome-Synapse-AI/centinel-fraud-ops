@@ -7,6 +7,7 @@ from pyspark.sql import types as T
 from fraud_data_common import (
     add_common_args,
     build_base_dataset_spark,
+    cache_df,
     create_spark_session,
     dataframe_from_records,
     ensure_output_paths,
@@ -62,13 +63,16 @@ def main() -> None:
             args.join_how,
             args.sample_rows,
         )
-        total_rows = df.count()
+        # df feeds many actions below (aggs, counts, the final write); cache it
+        # once so each action doesn't re-read and re-join the raw CSVs.
+        df = cache_df(df)
 
-        missing_exprs = [
+        missing_exprs = [F.count(F.lit(1)).alias("__total_rows__")] + [
             F.sum(F.when(is_missing_expr(df, column), 1).otherwise(0)).alias(column)
             for column in df.columns
         ]
         missing_row = df.agg(*missing_exprs).collect()[0].asDict()
+        total_rows = int(missing_row.pop("__total_rows__"))
         missing_records = [
             {
                 "column": column,
@@ -98,20 +102,35 @@ def main() -> None:
             if row["missing_percent"] > args.drop_column_missing_threshold
         ]
         working_df = df.drop(*columns_to_drop) if columns_to_drop else df
+        # working_df feeds the per-label report, the row-missing filter, the
+        # cleaning step, and the final write below — cache it once too.
+        working_df = cache_df(working_df)
+
+        non_label_columns = [c for c in working_df.columns if c != "isFraud"]
+        label_agg_exprs = [F.count(F.lit(1)).alias("__group_rows__")] + [
+            F.sum(F.when(is_missing_expr(working_df, column), 1).otherwise(0)).alias(column)
+            for column in non_label_columns
+        ]
+        # One groupBy pass computes missing counts for every label value at
+        # once, instead of filtering + aggregating separately per label.
+        # Restrict to isFraud in (0, 1) to match the original script's
+        # explicit "for label_value in [0, 1]" behavior.
+        label_grouped_rows = (
+            working_df.filter(F.col("isFraud").isin(0, 1))
+            .groupBy("isFraud")
+            .agg(*label_agg_exprs)
+            .collect()
+        )
 
         label_rows = []
-        for label_value in [0, 1]:
-            label_df = working_df.filter(F.col("isFraud") == label_value)
-            group_rows = label_df.count()
+        for grouped_row in label_grouped_rows:
+            row_dict = grouped_row.asDict()
+            label_value = row_dict.pop("isFraud")
+            group_rows = int(row_dict.pop("__group_rows__"))
             if group_rows == 0:
                 continue
-            label_missing_exprs = [
-                F.sum(F.when(is_missing_expr(working_df, column), 1).otherwise(0)).alias(column)
-                for column in working_df.columns
-            ]
-            label_missing = label_df.agg(*label_missing_exprs).collect()[0].asDict()
-            for column, missing_rows in label_missing.items():
-                if int(missing_rows) <= 0:
+            for column, missing_rows in row_dict.items():
+                if missing_rows is None or int(missing_rows) <= 0:
                     continue
                 label_rows.append(
                     {
@@ -157,16 +176,32 @@ def main() -> None:
                 T.DoubleType,
                 T.DecimalType,
             )
+            numeric_field_names = [
+                field.name for field in working_df.schema.fields
+                if isinstance(field.dataType, numeric_types)
+            ]
+            non_numeric_field_names = [
+                field.name for field in working_df.schema.fields
+                if field.name not in numeric_field_names
+            ]
+            # Single agg() computes the min for every numeric column in one
+            # pass, instead of one .select(F.min(...)).first() job per column.
+            min_row = (
+                working_df.agg(
+                    *[F.min(F.col(name).cast("double")).alias(name) for name in numeric_field_names]
+                ).collect()[0].asDict()
+                if numeric_field_names
+                else {}
+            )
             fill_map = {}
-            for field in working_df.schema.fields:
-                if isinstance(field.dataType, numeric_types):
-                    min_value = working_df.select(F.min(F.col(field.name).cast("double"))).first()[0]
-                    if min_value is None:
-                        fill_map[field.name] = float(args.numeric_fill_floor)
-                    else:
-                        fill_map[field.name] = float(min(args.numeric_fill_floor, min_value - 1.0))
+            for name in numeric_field_names:
+                min_value = min_row.get(name)
+                if min_value is None:
+                    fill_map[name] = float(args.numeric_fill_floor)
                 else:
-                    fill_map[field.name] = "__MISSING__"
+                    fill_map[name] = float(min(args.numeric_fill_floor, min_value - 1.0))
+            for name in non_numeric_field_names:
+                fill_map[name] = "__MISSING__"
             cleaned_df = working_df.fillna(fill_map)
             cleaning_strategy = "fillna_sentinel"
 
@@ -196,6 +231,8 @@ def main() -> None:
         write_single_csv(decision_df, args.reports_dir / "missing_value_cleaning_decisions.csv")
 
         write_single_csv(cleaned_df, args.output_csv)
+        working_df.unpersist()
+        df.unpersist()
 
         print(f"Joined rows: {total_rows:,}")
         print(f"Joined columns: {len(df.columns):,}")
