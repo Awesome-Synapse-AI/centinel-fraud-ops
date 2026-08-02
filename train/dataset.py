@@ -37,6 +37,6 @@ def time_based_split(
 
 def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     target = df["isFraud"].astype(int)
-    features = df.drop(columns=["isFraud"])
+    features = df.drop(columns=["isFraud", "TransactionDT", "TransactionID"], errors="ignore")
     features = features.select_dtypes(include=["number", "bool"]).fillna(0)
     return features, target
