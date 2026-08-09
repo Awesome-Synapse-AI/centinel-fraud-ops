@@ -6,8 +6,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from config.env import load_repo_env
 from monitor.cost_drift import cost_weighted_drift, kl_per_feature
 
+
+load_repo_env()
 
 st.set_page_config(page_title="Cost-Weighted Fraud Monitor", layout="wide")
 st.title("Cost-Weighted Fraud and Drift Console")

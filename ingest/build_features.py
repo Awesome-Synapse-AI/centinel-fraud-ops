@@ -7,6 +7,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from config.env import load_repo_env
+
 os.environ["HADOOP_HOME"] = r"C:\hadoop"
 os.environ["hadoop.home.dir"] = r"C:\hadoop"
 os.environ["PATH"] = r"C:\hadoop\bin;" + os.environ["PATH"]
@@ -16,6 +18,7 @@ os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 from pyspark import StorageLevel
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+from google.cloud import bigquery
 
 from scripts.fraud_data_common import (
     DEFAULT_OUTPUT_ROOT,
@@ -51,6 +54,15 @@ def parse_args() -> argparse.Namespace:
             "When provided, ingestion uses this audited dataset instead of re-reading raw CSVs."
         ),
     )
+    parser.add_argument(
+        "--bigquery-table",
+        type=str,
+        default=os.environ.get("FEAST_BIGQUERY_TABLE"),
+        help=(
+            "Optional fully qualified BigQuery table name to load the parquet into, "
+            "for example your-project.fraud_features.features_v1."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -69,7 +81,18 @@ def resolve_preprocessed_csv_path(path: Path) -> Path:
     )
 
 
+def load_parquet_to_bigquery(parquet_path: Path, table_ref: str) -> None:
+    client = bigquery.Client()
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+    )
+    pdf = pd.read_parquet(parquet_path)
+    job = client.load_table_from_dataframe(pdf, table_ref, job_config=job_config)
+    job.result()
+
+
 def main() -> None:
+    load_repo_env()
     args = parse_args()
     ensure_output_dir(args.output_dir)
 
@@ -126,6 +149,8 @@ def main() -> None:
         )
         output_path = args.output_dir / "features.parquet"
         featured_df.write.mode("overwrite").parquet(str(output_path))
+        if args.bigquery_table:
+            load_parquet_to_bigquery(output_path, args.bigquery_table)
 
         profile_row = (
             featured_df.agg(
@@ -149,6 +174,8 @@ def main() -> None:
         write_single_csv(profile_df, args.output_dir / "dataset_profile.csv")
 
         print(f"Wrote features to {output_path}")
+        if args.bigquery_table:
+            print(f"Loaded features into BigQuery table {args.bigquery_table}")
         print(f"Rows: {profile_row['rows']:,}")
         print(f"Columns: {profile_row['columns']:,}")
         featured_df.unpersist()

@@ -1,15 +1,26 @@
 from datetime import timedelta
+import os
+import sys
+from pathlib import Path
 
-from feast import Entity, FeatureService, FeatureView, Field
-from feast.infra.offline_stores.file_source import FileSource
+from feast import BigQuerySource, Entity, FeatureService, FeatureView, Field
 from feast.types import Float32, Int64
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from config.env import load_repo_env
+
+
+load_repo_env()
 
 
 card = Entity(name="card1", join_keys=["card1"])
 
-tx_source = FileSource(
-    path="data/staged/v1/",
-    timestamp_field="ts",
+tx_source = BigQuerySource(
+    table_ref=os.environ.get("FEAST_BIGQUERY_TABLE", "your-project.fraud_features.features_v1"),
+    event_timestamp_column="ts",
 )
 
 tx_fv = FeatureView(

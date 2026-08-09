@@ -6,6 +6,11 @@ from pathlib import Path
 import joblib
 from google.cloud import storage
 
+from config.env import load_repo_env
+
+
+load_repo_env()
+
 
 def _download_from_gcs(gcs_uri: str, local_path: Path) -> Path:
     bucket_name, blob_name = gcs_uri.removeprefix("gs://").split("/", 1)
