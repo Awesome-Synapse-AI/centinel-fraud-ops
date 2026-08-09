@@ -26,6 +26,25 @@ def log_step(message: str) -> None:
     print(f"[train] {message}", flush=True)
 
 
+def print_classification_report(report: dict) -> None:
+    label_order = ["0", "1", "accuracy", "macro avg", "weighted avg"]
+    print("[train] Classification report:", flush=True)
+    for label in label_order:
+        row = report.get(label)
+        if isinstance(row, dict):
+            print(
+                "  "
+                f"{label:>12}  "
+                f"precision={row.get('precision', 0.0):.6f}  "
+                f"recall={row.get('recall', 0.0):.6f}  "
+                f"f1={row.get('f1-score', 0.0):.6f}  "
+                f"support={int(row.get('support', 0))}",
+                flush=True,
+            )
+        elif isinstance(row, (float, int)):
+            print(f"  {label:>12}  {row:.6f}", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     default_feature_repo = Path(__file__).resolve().parent.parent / "feature_repo"
     parser = argparse.ArgumentParser(description="Train the fraud model locally or in Cloud Run.")
@@ -102,6 +121,7 @@ def main() -> None:
     calibrated = calibrate_classifier(model, x_val, y_val)
     log_step("Evaluating model")
     metrics = evaluate_model(calibrated, x_test, y_test)
+    report = metrics.get("classification_report", {})
     log_step("Computing feature importance")
     importance = feature_importance(model, list(x_train.columns))
     log_step(f"Saving model bundle to {args.output}")
@@ -109,7 +129,11 @@ def main() -> None:
 
     log_step(f"Saved model bundle to {args.output}")
     for key, value in metrics.items():
+        if key == "classification_report":
+            continue
         print(f"{key}={value:.6f}")
+    if isinstance(report, dict):
+        print_classification_report(report)
 
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
     if tracking_uri:
