@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from feast import BigQuerySource, Entity, FeatureService, FeatureView, Field
+from feast import ValueType
 from feast.types import Float32, Int64
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -16,11 +17,11 @@ from config.env import load_repo_env
 load_repo_env()
 
 
-card = Entity(name="card1", join_keys=["card1"])
+card = Entity(name="card1", join_keys=["card1"], value_type=ValueType.INT64)
 
 tx_source = BigQuerySource(
-    table_ref=os.environ.get("FEAST_BIGQUERY_TABLE", "your-project.fraud_features.features_v1"),
-    event_timestamp_column="ts",
+    table=os.environ.get("FEAST_BIGQUERY_TABLE", "your-project.fraud_features.features_v1"),
+    timestamp_field="ts",
 )
 
 tx_fv = FeatureView(

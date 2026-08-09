@@ -85,8 +85,13 @@ def load_parquet_to_bigquery(parquet_path: Path, table_ref: str) -> None:
     client = bigquery.Client()
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        schema=[
+            bigquery.SchemaField("ts", "TIMESTAMP"),
+        ],
     )
     pdf = pd.read_parquet(parquet_path)
+    if "ts" in pdf.columns:
+        pdf["ts"] = pd.to_datetime(pdf["ts"], utc=True)
     job = client.load_table_from_dataframe(pdf, table_ref, job_config=job_config)
     job.result()
 

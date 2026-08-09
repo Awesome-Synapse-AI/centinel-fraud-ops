@@ -19,10 +19,15 @@ table_ref = os.environ["FEAST_BIGQUERY_TABLE"]
 
 client = bigquery.Client()
 df = pd.read_parquet(parquet_path)
+if "ts" in df.columns:
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
 job = client.load_table_from_dataframe(
     df,
     table_ref,
-    job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
+    job_config=bigquery.LoadJobConfig(
+        write_disposition="WRITE_TRUNCATE",
+        schema=[bigquery.SchemaField("ts", "TIMESTAMP")],
+    ),
 )
 job.result()
 print(f"Loaded {parquet_path} -> {table_ref}")

@@ -1,9 +1,9 @@
-project: fraud_pipeline
-registry: ${FEAST_REGISTRY_PATH}
+project: fraud_cost_pipeline
+registry: gs://fraud-cost-pipeline-artifacts/registry/registry.db
 provider: gcp
 offline_store:
   type: bigquery
-  dataset: ${FEAST_BIGQUERY_DATASET}
+  dataset: my_bq
 online_store:
   type: datastore
-  project_id: ${GCP_PROJECT_ID}
+  project_id: fraud-cost-pipeline

@@ -48,13 +48,19 @@ feast -c feature_repo apply
 feast -c feature_repo materialize-incremental 2026-07-26T00:00:00
 ```
 
-7. Train a model locally:
+7. Upload the staged parquet to BigQuery:
 
 ```bash
-python train/train.py --features data/staged/v1/features.parquet --output outputs/model.joblib
+python scripts/upload_parquet.py
 ```
 
-8. Start the scorer:
+8. Train a model from the uploaded BigQuery table:
+
+```bash
+python train/train.py --output outputs/model.joblib
+```
+
+9. Start the scorer:
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8080
@@ -104,5 +110,7 @@ raw Kaggle CSVs
 -> outputs/preprocessing/03_label_corr_filtered.csv
 -> ingest/build_features.py
 -> data/staged/v1/features.parquet
+-> scripts/upload_parquet.py
+-> BigQuery table in FEAST_BIGQUERY_TABLE
 -> train/train.py
 ```

@@ -1,4 +1,4 @@
-project: fraud_pipeline
+project: fraud_cost_pipeline
 registry: data/registry/registry.db
 provider: local
 offline_store:
