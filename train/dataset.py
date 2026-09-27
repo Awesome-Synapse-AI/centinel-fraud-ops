@@ -35,6 +35,22 @@ def time_based_split(
     )
 
 
+def describe_split(df: pd.DataFrame, name: str) -> dict[str, float]:
+    if "isFraud" not in df.columns:
+        raise ValueError("Expected isFraud column for split diagnostics.")
+    if "TransactionDT" not in df.columns:
+        raise ValueError("Expected TransactionDT column for split diagnostics.")
+
+    fraud_rate = float(df["isFraud"].astype(int).mean()) if len(df) else 0.0
+    return {
+        "split": name,
+        "rows": float(len(df)),
+        "fraud_rate": fraud_rate,
+        "min_TransactionDT": float(df["TransactionDT"].min()) if len(df) else 0.0,
+        "max_TransactionDT": float(df["TransactionDT"].max()) if len(df) else 0.0,
+    }
+
+
 def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     target = df["isFraud"].astype(int)
     features = df.drop(columns=["isFraud", "TransactionDT", "TransactionID"], errors="ignore")
