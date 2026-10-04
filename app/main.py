@@ -49,8 +49,9 @@ def predict(payload: PredictRequest) -> dict[str, Any]:
     active_bundle = get_model_bundle()
     model = active_bundle["model"]
     feature_names = active_bundle["feature_names"]
+    threshold = float(active_bundle.get("threshold", 0.5))
     values = payload.model_dump(by_alias=False)
     row = {feature: values.get(feature, 0) for feature in feature_names}
     frame = pd.DataFrame([row]).fillna(0)
     fraud_prob = float(model.predict_proba(frame)[0, 1])
-    return {"fraud_prob": fraud_prob, "flag": fraud_prob >= 0.5}
+    return {"fraud_prob": fraud_prob, "flag": fraud_prob >= threshold, "threshold": threshold}

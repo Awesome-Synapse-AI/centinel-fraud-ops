@@ -12,6 +12,7 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
+from sklearn.model_selection import ParameterGrid
 from sklearn.metrics import (
     average_precision_score,
     classification_report,
@@ -49,6 +50,11 @@ class SpinnerProgress:
         return False
 
 
+def _average_precision_scorer(estimator, x: pd.DataFrame, y: pd.Series) -> float:
+    """Score XGBoost probabilities without sklearn estimator-tag inference."""
+    return float(average_precision_score(y, estimator.predict_proba(x)[:, 1]))
+
+
 def train_xgb_classifier(
     x_train: pd.DataFrame,
     y_train: pd.Series,
@@ -82,6 +88,133 @@ def train_xgb_classifier(
     with SpinnerProgress("Training XGBoost classifier"):
         model.fit(x_train, y_train, eval_set=[(x_val, y_val)], verbose=False)
     return model
+
+
+def grid_search_xgb_classifier(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    param_grid: dict[str, list] | None = None,
+    validation_fraction: float = 0.2,
+    results_dir: Path | None = None,
+) -> dict:
+    """Find parameters with one chronological holdout from the train split.
+
+    This deliberately does not use k-fold cross-validation or shuffle rows.
+    The last part of ``x_train`` is used as a future-like search holdout. The
+    caller should still refit the selected parameters on the complete train
+    split before using the project's external validation and test splits.
+    """
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between 0 and 1.")
+    split_at = int(len(x_train) * (1.0 - validation_fraction))
+    if split_at < 1 or split_at >= len(x_train):
+        raise ValueError("x_train must contain enough rows for a search holdout.")
+
+    x_search_train = x_train.iloc[:split_at]
+    y_search_train = y_train.iloc[:split_at]
+    x_search_val = x_train.iloc[split_at:]
+    y_search_val = y_train.iloc[split_at:]
+    if y_search_train.nunique() < 2 or y_search_val.nunique() < 2:
+        raise ValueError("Both chronological search partitions must contain both classes.")
+
+    neg = max(int((y_train == 0).sum()), 1)
+    pos = max(int((y_train == 1).sum()), 1)
+    base_params = {
+        "objective": "binary:logistic",
+        "eval_metric": "aucpr",
+        "tree_method": "hist",
+        "scale_pos_weight": max(1.0, neg / pos),
+        "random_state": 42,
+        "n_jobs": 1,
+    }
+    search_grid = param_grid or {
+        "n_estimators": [300, 500],
+        "max_depth": [5, 7, 10],
+        "learning_rate": [0.03, 0.1],
+        "min_child_weight": [2, 3, 5],
+        "subsample": [0.85],
+        "colsample_bytree": [0.8],
+    }
+    results: list[dict] = []
+    candidates = list(ParameterGrid(search_grid))
+    if results_dir is not None:
+        results_dir.mkdir(parents=True, exist_ok=True)
+    with SpinnerProgress("Searching XGBoost hyperparameters"):
+        for candidate_number, candidate in enumerate(candidates, start=1):
+            run_dir = None
+            if results_dir is not None:
+                run_dir = results_dir / f"config-{candidate_number:03d}"
+                run_dir.mkdir(parents=True, exist_ok=True)
+                (run_dir / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "candidate_number": candidate_number,
+                            "parameters": candidate,
+                            "base_parameters": base_params,
+                            "search_train_rows": len(x_search_train),
+                            "search_validation_rows": len(x_search_val),
+                        },
+                        indent=2,
+                        default=str,
+                    ),
+                    encoding="utf-8",
+                )
+            print(
+                f"[grid-search] run {candidate_number}/{len(candidates)} "
+                f"config={json.dumps(candidate, sort_keys=True, default=str)}",
+                flush=True,
+            )
+            estimator = xgb.XGBClassifier(**base_params, **candidate)
+            started = time.perf_counter()
+            estimator.fit(
+                x_search_train,
+                y_search_train,
+                eval_set=[(x_search_val, y_search_val)],
+                verbose=False,
+            )
+            score = _average_precision_scorer(estimator, x_search_val, y_search_val)
+            probabilities = estimator.predict_proba(x_search_val)[:, 1]
+            elapsed = time.perf_counter() - started
+            result = {
+                "candidate_number": candidate_number,
+                "parameters": candidate,
+                "average_precision": float(score),
+                "roc_auc": float(roc_auc_score(y_search_val, probabilities)),
+                "positive_rate_pred": float(np.mean(probabilities >= 0.5)),
+                "fit_time_seconds": float(elapsed),
+                "best_iteration": int(getattr(estimator, "best_iteration", -1)),
+            }
+            results.append(
+                {
+                    "params": candidate,
+                    "mean_test_score": result["average_precision"],
+                    "roc_auc": result["roc_auc"],
+                    "fit_time": result["fit_time_seconds"],
+                    "best_iteration": result["best_iteration"],
+                }
+            )
+            if run_dir is not None:
+                (run_dir / "result.json").write_text(
+                    json.dumps(result, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            print(
+                f"[grid-search] run {candidate_number}/{len(candidates)} done "
+                f"time={elapsed:.2f}s average_precision={score:.6f} "
+                f"roc_auc={result['roc_auc']:.6f}",
+                flush=True,
+            )
+
+    if not results:
+        raise ValueError("param_grid must contain at least one parameter combination.")
+    best = max(results, key=lambda row: row["mean_test_score"])
+    return {
+        "best_params": dict(best["params"]),
+        "best_score": float(best["mean_test_score"]),
+        "results": results,
+        "search_train_rows": len(x_search_train),
+        "search_validation_rows": len(x_search_val),
+    }
 
 
 def calibrate_classifier(
