@@ -45,7 +45,7 @@ def timed_step(message: str):
 
 def parse_args() -> argparse.Namespace:
     default_feature_repo = Path(__file__).resolve().parent.parent / "feature_repo"
-    parser = argparse.ArgumentParser(description="Train the fraud model locally or in Cloud Run.")
+    parser = argparse.ArgumentParser(description="Train the fraud model locally or for VM deployment.")
     parser.add_argument(
         "--feature-repo",
         type=Path,

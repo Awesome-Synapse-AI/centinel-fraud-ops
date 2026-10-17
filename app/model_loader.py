@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 
 import joblib
-from google.cloud import storage
 
 from config.env import load_repo_env
 
@@ -13,6 +12,8 @@ load_repo_env()
 
 
 def _download_from_gcs(gcs_uri: str, local_path: Path) -> Path:
+    from google.cloud import storage
+
     bucket_name, blob_name = gcs_uri.removeprefix("gs://").split("/", 1)
     local_path.parent.mkdir(parents=True, exist_ok=True)
     storage.Client().bucket(bucket_name).blob(blob_name).download_to_filename(local_path)
@@ -20,7 +21,7 @@ def _download_from_gcs(gcs_uri: str, local_path: Path) -> Path:
 
 
 def resolve_model_path() -> Path:
-    local_model_path = os.getenv("MODEL_PATH", "outputs/model.joblib")
+    local_model_path = os.getenv("MODEL_PATH", "outputs/best-params.joblib")
     gcs_model_uri = os.getenv("MODEL_GCS_URI")
 
     if gcs_model_uri:

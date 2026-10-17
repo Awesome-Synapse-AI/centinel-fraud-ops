@@ -65,12 +65,12 @@ def train_xgb_classifier(
     neg = max(int((y_train == 0).sum()), 1)
     pos = max(int((y_train == 1).sum()), 1)
     base_params = {
-        "n_estimators": 600,
-        "max_depth": 5,
-        "learning_rate": 0.03,
+        "n_estimators": 500,
+        "max_depth": 10,
+        "learning_rate": 0.1,
         "subsample": 0.85,
         "colsample_bytree": 0.8,
-        "min_child_weight": 5,
+        "min_child_weight": 3,
         "gamma": 1.0,
         "reg_alpha": 0.1,
         "reg_lambda": 2.0,
@@ -256,7 +256,7 @@ def evaluate_model(
     y_test: pd.Series,
     threshold: float | None = None,
     beta: float = 2.0,
-) -> dict[str, float | dict]:
+) -> dict[str, float | None | dict]:
     val_prob = model.predict_proba(x_val)[:, 1]
     tuned_threshold, val_fbeta = find_best_threshold(y_val, val_prob, beta=beta)
     decision_threshold = tuned_threshold if threshold is None else threshold
@@ -265,12 +265,20 @@ def evaluate_model(
     flag = (fraud_prob >= decision_threshold).astype(int)
     report_text = classification_report(y_test, flag, zero_division=0)
     report = classification_report(y_test, flag, output_dict=True, zero_division=0)
+    # ROC AUC is undefined when the time-based test slice contains only one
+    # class.  Do not let that valid (if undesirable) split shape prevent the
+    # trained model from being persisted after evaluation.
+    roc_auc_test = (
+        float(roc_auc_score(y_test, fraud_prob))
+        if y_test.nunique() >= 2
+        else None
+    )
     return {
         "threshold": float(decision_threshold),
         "val_threshold": float(tuned_threshold),
         "val_fbeta": float(val_fbeta),
         "aucpr_test": float(average_precision_score(y_test, fraud_prob)),
-        "roc_auc_test": float(roc_auc_score(y_test, fraud_prob)),
+        "roc_auc_test": roc_auc_test,
         "positive_rate_pred": float(np.mean(flag)),
         "classification_report_text": report_text,
         "classification_report": report,
@@ -297,7 +305,7 @@ def save_bundle(
     output_path: Path,
     calibrated_model,
     feature_names: list[str],
-    metrics: dict[str, float | dict],
+    metrics: dict[str, float | None | dict],
     importance: dict[str, float],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
