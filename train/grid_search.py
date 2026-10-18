@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 from feast import FeatureStore
+import mlflow
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -57,12 +58,25 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory for one config.json/result.json folder per search run.",
     )
+    parser.add_argument(
+        "--experiment",
+        default=os.getenv("MLFLOW_EXPERIMENT_NAME", "fraud-xgboost-grid-search"),
+        help="MLflow experiment name.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     load_repo_env()
+    tracking_uri = os.getenv(
+        "MLFLOW_TRACKING_URI",
+        f"sqlite:///{(REPO_ROOT / 'outputs' / 'mlflow.db').as_posix()}",
+    )
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment(args.experiment)
+    print(f"mlflow_tracking_uri={tracking_uri}")
+    print(f"mlflow_experiment={args.experiment}")
     table_ref = os.environ["FEAST_BIGQUERY_TABLE"]
 
     store = FeatureStore(repo_path=str(args.feature_repo.resolve()))
@@ -81,30 +95,46 @@ def main() -> None:
     x_val, y_val = prepare_xy(split.val)
     x_test, y_test = prepare_xy(split.test)
 
-    search = grid_search_xgb_classifier(
-        x_train,
-        y_train,
-        validation_fraction=args.search_validation_fraction,
-        results_dir=args.results_dir or args.output.with_suffix(".grid-search-runs"),
-    )
-    best_params = search["best_params"]
-    print(f"best_search_average_precision={search['best_score']:.6f}")
-    print(f"best_params={json.dumps(best_params, sort_keys=True)}")
+    with mlflow.start_run(run_name="grid-search-and-refit") as parent_run:
+        mlflow.log_params({
+            "search_validation_fraction": args.search_validation_fraction,
+            "feature_service": args.feature_service,
+            "train_rows": len(x_train),
+            "validation_rows": len(x_val),
+            "test_rows": len(x_test),
+            "feature_count": len(x_train.columns),
+        })
+        search = grid_search_xgb_classifier(
+            x_train,
+            y_train,
+            validation_fraction=args.search_validation_fraction,
+            results_dir=args.results_dir or args.output.with_suffix(".grid-search-runs"),
+        )
+        best_params = search["best_params"]
+        print(f"best_search_average_precision={search['best_score']:.6f}")
+        print(f"best_params={json.dumps(best_params, sort_keys=True)}")
 
-    model = train_xgb_classifier(x_train, y_train, x_val, y_val, params=best_params)
-    calibrated = calibrate_classifier(model, x_val, y_val)
-    metrics = evaluate_model(calibrated, x_val, y_val, x_test, y_test)
-    metrics["best_search_average_precision"] = float(search["best_score"])
-    metrics["best_params"] = best_params
-    metrics["search_train_rows"] = search["search_train_rows"]
-    metrics["search_validation_rows"] = search["search_validation_rows"]
-    results_path = args.results or args.output.with_suffix(".grid-search.csv")
-    results_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(search["results"]).to_csv(results_path, index=False)
-    save_bundle(args.output, calibrated, list(x_train.columns), metrics, feature_importance(model, list(x_train.columns)))
-    print(f"saved_model={args.output}")
-    print(f"saved_grid_search_results={results_path}")
-    print(f"saved_grid_search_run_artifacts={args.results_dir or args.output.with_suffix('.grid-search-runs')}")
+        model = train_xgb_classifier(x_train, y_train, x_val, y_val, params=best_params)
+        calibrated = calibrate_classifier(model, x_val, y_val)
+        metrics = evaluate_model(calibrated, x_val, y_val, x_test, y_test)
+        metrics["best_search_average_precision"] = float(search["best_score"])
+        metrics["best_params"] = best_params
+        metrics["search_train_rows"] = search["search_train_rows"]
+        metrics["search_validation_rows"] = search["search_validation_rows"]
+        results_path = args.results or args.output.with_suffix(".grid-search.csv")
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(search["results"]).to_csv(results_path, index=False)
+        save_bundle(args.output, calibrated, list(x_train.columns), metrics, feature_importance(model, list(x_train.columns)))
+        mlflow.log_params({f"best_{key}": value for key, value in best_params.items()})
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)) and value is not None:
+                mlflow.log_metric(key, value)
+        mlflow.log_artifact(str(args.output), artifact_path="model")
+        mlflow.log_artifact(str(results_path), artifact_path="search")
+        print(f"saved_model={args.output}")
+        print(f"saved_grid_search_results={results_path}")
+        print(f"saved_grid_search_run_artifacts={args.results_dir or args.output.with_suffix('.grid-search-runs')}")
+        print(f"mlflow_run_id={parent_run.info.run_id}")
 
 
 if __name__ == "__main__":

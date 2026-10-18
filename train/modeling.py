@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import joblib
+import mlflow
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -198,6 +199,17 @@ def grid_search_xgb_classifier(
                     json.dumps(result, indent=2, default=str),
                     encoding="utf-8",
                 )
+            if mlflow.active_run() is not None:
+                with mlflow.start_run(
+                    run_name=f"candidate-{candidate_number:03d}", nested=True
+                ):
+                    mlflow.log_params(candidate)
+                    mlflow.log_metric("average_precision", result["average_precision"])
+                    mlflow.log_metric("roc_auc", result["roc_auc"])
+                    mlflow.log_metric("fit_time_seconds", result["fit_time_seconds"])
+                    mlflow.log_metric("best_iteration", result["best_iteration"])
+                    if run_dir is not None:
+                        mlflow.log_artifacts(str(run_dir))
             print(
                 f"[grid-search] run {candidate_number}/{len(candidates)} done "
                 f"time={elapsed:.2f}s average_precision={score:.6f} "
