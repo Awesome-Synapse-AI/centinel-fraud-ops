@@ -5,7 +5,7 @@ import pandas as pd
 from scipy.stats import entropy
 
 
-DAILY_DOLLAR_THRESHOLD = 5000.0
+DAILY_DOLLAR_THRESHOLD = 0.5
 
 
 def kl_per_feature(baseline: pd.DataFrame, prod: pd.DataFrame, bins: int = 50) -> dict[str, float]:
