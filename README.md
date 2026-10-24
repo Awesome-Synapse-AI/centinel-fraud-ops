@@ -1,4 +1,4 @@
-# Cost-Weighted Fraud Detection Pipeline
+# Cost-Weighted Fraud Detection on GCP
 
 A fraud-detection pipeline built around reproducible data preparation, XGBoost model training and calibration, and a FastAPI inference service. The production inference service is deployed as a **Docker container on a single Google Compute Engine VM**. The trained model artifact remains in Google Cloud Storage (GCS), separate from the container image.
 
