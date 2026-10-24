@@ -156,6 +156,69 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 The production container listens on port `8080`. Configure the model source through the environment rather than relying on a developer-specific absolute file path.
 
+## Demo console: scoring + cost-weighted drift review
+
+`demo/` contains a self-contained Streamlit console plus the CLI helpers used to prepare its inputs. It is meant for local walkthroughs of the two things this pipeline cares about: scoring a transaction and watching for feature drift that is expensive in fraud-cost terms, not just statistically significant.
+
+| File | Purpose |
+|---|---|
+| `demo/streamlit_app.py` | Two-pane console: score a sampled row from the prepared test CSV against the live FastAPI scorer, and view a cost-weighted drift leaderboard comparing a baseline window to a production window. |
+| `demo/prepare_drift_windows.py` | Builds the `baseline_window.parquet` / `production_window.parquet` / `shap_importance.json` inputs the console reads, aligned to a trained model's feature schema. Either splits one historical Parquet file chronologically by `TransactionDT` (`--source`), or accepts two already-separated windows (`--baseline` / `--production`). |
+| `demo/seed_drift_scenario.py` | Synthetic drift generator: shifts one numeric feature by a configurable number of standard deviations for a fraction of rows, so you can demo the drift leaderboard and alerting without waiting on real production drift. |
+| `demo/run_drift_analysis.py` | CLI equivalent of the drift leaderboard pane. Ranks features by estimated dollar cost of drift (using the cost-weighted drift utilities in `monitor/cost_drift.py`) and, with `--send-alert`, persists/forwards an alert through `monitor/alerting.py` once cumulative cost crosses a threshold. |
+
+### Running the console
+
+```bash
+make demo
+# equivalent to:
+streamlit run demo/streamlit_app.py
+```
+
+The sidebar exposes the settings below (each also configurable via environment variable, loaded from `.env` through `config/env.py`):
+
+| Setting | Env var | Default | Notes |
+|---|---|---|---|
+| Scorer URL | `SCORER_URL` | `http://localhost:8080` | Base URL for the FastAPI service; the console calls `/health` and `/predict`. Start it with `make score`. |
+| Prepared test CSV | `TEST_DATA_CSV` | `outputs/preprocessing/prepared/test_prepared.csv` | Source of sample rows for the scoring pane; produced by the preprocessing pipeline in step 2 above. |
+| Drift data directory | `DEMO_DATA_DIR` | `outputs/demo` | Must contain `baseline_window.parquet`, `production_window.parquet`, and `shap_importance.json`, produced by `demo/prepare_drift_windows.py`. |
+
+The scoring pane sends the selected row as named model features to `/predict` and shows the returned fraud probability, decision threshold, and flag status. The drift pane computes a per-feature KL divergence between the two windows, weighs it by SHAP-derived feature importance and the configured fraud-cost assumptions (`p_fraud`, false-negative cost, false-positive cost), and charts the top offending features by estimated dollar impact.
+
+### End-to-end example
+
+```bash
+# 1. Start the scorer in a separate terminal
+make score
+
+# 2. Build baseline/production windows and importance weights from a trained
+#    model and a historical feature dataset (chronological split)
+python demo/prepare_drift_windows.py \
+  --source data/staged/v1/features.parquet \
+  --model outputs/model.joblib \
+  --output-dir outputs/demo
+
+# 3. Optional: inject synthetic drift into one feature for the demo
+python demo/seed_drift_scenario.py \
+  --baseline outputs/demo/baseline_window.parquet \
+  --output outputs/demo/production_window.parquet \
+  --feature merch_fraud_rate_30d
+
+# 4. Launch the console
+make demo
+```
+
+To rank drift from the command line instead of (or in addition to) the Streamlit pane, including sending an alert when the cumulative cost-weighted drift crosses the configured threshold:
+
+```bash
+python demo/run_drift_analysis.py \
+  --baseline outputs/demo/baseline_window.parquet \
+  --production outputs/demo/production_window.parquet \
+  --importance outputs/demo/shap_importance.json \
+  --top 10 \
+  --send-alert
+```
+
 ## Deploy the trained model to GCP with Docker
 
 The deployment uses the model artifact in GCS and the scorer image in Artifact Registry. Do not bake the trained model into the Docker image or copy a local Windows path into the container.
