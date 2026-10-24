@@ -15,17 +15,41 @@ A fraud-detection pipeline built around reproducible data preparation, XGBoost m
 
 ## Architecture and deployment scope
 
-The deployment described here uses Docker on a regular Compute Engine VM. It does not require a container orchestrator.
+The diagram below is the full picture: an offline pipeline that produces a model, a single production service that scores transactions, and optional tooling for demos and drift monitoring. The production piece is intentionally small — a Docker container on a regular Compute Engine VM, with no container orchestrator involved.
 
-1. Train and calibrate the model.
-2. Publish the selected champion artifact to Cloud Storage.
-3. Build the FastAPI scorer Docker image.
-4. Push the image to Artifact Registry.
-5. Create or reuse a Compute Engine VM and install Docker.
-6. Pull and run one scorer container on the VM.
-7. The container downloads the champion model from GCS using the VM's attached service account.
+![Centinel Fraud Detection – System Architecture: end-to-end flow from data preparation and model training to deployment, monitoring, and demoing](docs/images/architecture.png)
 
-### GCP components
+**In one paragraph:** stages 1–4 (bottom-left to top-middle) run offline and end with two artifacts sitting in GCP — a trained model in Cloud Storage and a scorer image in Artifact Registry. Stage 5 is the only stage that serves live traffic: a Compute Engine VM pulls both artifacts and runs the FastAPI scorer. Stages 6–8 are optional — a local demo console, the clients that call the scorer, and a drift-monitoring loop — and none of them sit in the request path of stage 5.
+
+### Stage by stage
+
+**1. Data preparation & model training** *(local / notebook / VM)* — Join the raw IEEE-CIS CSVs, clean and encode them, engineer rolling velocity and merchant-risk features, then train and calibrate the XGBoost model and pick a decision threshold. Nothing here needs GCP to be reachable except the optional BigQuery upload.  
+Code: `scripts/04_run_preprocessing_pipeline.py`, `ingest/build_features.py`, `train/train.py` / `train/modeling.py` / `train/grid_search.py`.
+
+**2. Data & feature store (BigQuery)** — The engineered features land in a BigQuery table that acts as Feast's offline store: the single source of truth that both training and online feature retrieval read from.  
+Code: `scripts/upload_parquet.py` writes the table named by `FEAST_BIGQUERY_TABLE`.
+
+**3. Feature retrieval (Feast)** — Feast defines entities and feature views over that BigQuery table, giving point-in-time-correct historical retrieval for training plus a materialized online store for low-latency lookups.  
+Code: `feature_repo/features.py`, `feature_repo/feature_store.yaml` (`feast apply` / `feast materialize-incremental`).
+
+**4. Model artifacts** — The winning calibrated model bundle (model, feature list, threshold) is published to Cloud Storage as the "champion" artifact, independent of the serving container. Separately, the FastAPI scorer image is built and pushed to Artifact Registry.  
+Code: `train/publish_champion.py` → `gs://<PROJECT_ID>-artifacts/models/champion/model.joblib`; `deploy/Dockerfile` + `deploy/vm/cloudbuild.yaml` → Artifact Registry image.
+
+**5. Model serving (production)** — A Compute Engine VM runs one Docker container. On startup the container downloads the champion model from GCS using the VM's attached service account, then serves `GET /health` (readiness/threshold check) and `POST /predict` (score a transaction, return probability + threshold + flag). See [Deploy the trained model to GCP with Docker](#deploy-the-trained-model-to-gcp-with-docker) below for the exact commands.  
+Code: `app/main.py`, `app/model_loader.py`; deployed by `deploy/vm/deploy-vm.ps1`.
+
+**6. Demo & exploration** *(optional)* — A local Streamlit console scores a sampled transaction against the running FastAPI service and shows the cost-weighted drift leaderboard, without touching production traffic. This repository ships that console in place of a separate notebook/CLI demo app.  
+Code: `demo/streamlit_app.py` (`make demo`), fed by `demo/prepare_drift_windows.py` and `demo/seed_drift_scenario.py` — see [Demo console](#demo-console-scoring--cost-weighted-drift-review) below.
+
+**7. Users / clients** — Any HTTP client — the Streamlit demo, a web app, a batch job — calls the deployed scorer's `/predict` endpoint over HTTPS on port `8080` with JSON transaction features and gets back a probability, threshold, and flag.  
+Code: `POST /predict` on the Compute Engine VM, consumed directly or via `demo/streamlit_app.py`'s "Scorer URL" setting.
+
+**8. Monitoring & drift detection** *(optional)* — Baseline vs. recent production feature windows are compared feature-by-feature (KL divergence), weighted by SHAP-style model importance and fraud/false-positive cost assumptions, to rank drift by expected dollar impact. Once cumulative cost crosses a threshold, an alert is persisted and forwarded to a notification endpoint.  
+Code: `monitor/cost_drift.py` (drift math) driven by `demo/run_drift_analysis.py --send-alert` or the Streamlit drift pane; `monitor/alerting.py` persists to Firestore and calls the HTTP endpoint in `gcp/alert_function/main.py` (deployed via `deploy/deploy-alert-function.ps1`).
+
+> A few labels in the diagram (a notebook demo, `monitor/dashboard.py`, `monitor/calculate_drift.py`, `monitor/save_drift.py`, `monitor/alert_receiver.py`) are illustrative rather than literal filenames — the "Code" lines above point at what actually implements each responsibility in this repository.
+
+### GCP components used by production serving (stage 5)
 
 | Component | Purpose |
 |---|---|
