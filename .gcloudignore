@@ -1,0 +1,18 @@
+# Keep Cloud Build uploads small and prevent local credentials from leaving
+# this workstation.  The model is retrieved from GCS at pod startup.
+.gcloudignore
+.git
+.gitignore
+.dockerignore
+.env
+.envrc
+.venv/
+__pycache__/
+*.py[cod]
+dataset/
+outputs/
+data/
+notebooks/
+tests/
+*.ipynb
+config/service-account.json

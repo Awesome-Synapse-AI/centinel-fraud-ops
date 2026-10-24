@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+config/service-account.json
+.venv
+__pycache__/
+*.py[cod]
+dataset/
+outputs/
+data/
+notebooks/
+tests/
+*.ipynb
