@@ -206,7 +206,7 @@ Raw XGBoost scores are not well-calibrated probabilities. `calibrate_classifier`
 
 ### What gets evaluated and saved
 
-`evaluate_model` reports, on the held-out test split: average precision (`aucpr_test`), ROC-AUC (`roc_auc_test`, left `null` if the test slice happens to contain only one class), the predicted positive rate, and a full `sklearn.classification_report` at the chosen threshold. `feature_importance` separately pulls XGBoost's gain-based importance (total split gain per feature) from the uncalibrated booster. `save_bundle` then writes:
+`evaluate_model` reports, on the held-out test split: average precision (`aucpr_test`), ROC-AUC (`roc_auc_test`, left `null` if the test slice happens to contain only one class), the predicted positive rate, and a full `sklearn.classification_report` at the chosen threshold. `feature_importance` separately pulls XGBoost's gain-based importance (total split gain per feature) from the uncalibrated booster. `save_bundle` then writes several files next to each other. Below, `<output>` is a placeholder for whatever path you passed to `--output` with its extension removed — for example, `--output outputs/model-grid-search.joblib` makes `<output>` equal to `outputs/model-grid-search`, so the files on disk are literally named `outputs/model-grid-search.metrics.json`, `outputs/model-grid-search.importance.json`, and so on:
 
 - `<output>.joblib` — the artifact `app/model_loader.py` loads in production: calibrated model, feature list, threshold, metrics, importance, and the categorical-mapping fingerprint.
 - `<output>.metrics.json` — the raw metrics dict shown below.
