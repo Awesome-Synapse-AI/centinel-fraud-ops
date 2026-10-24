@@ -263,9 +263,9 @@ The numbers below are from one completed `python train/grid_search.py --output o
 
 **How to read this run:**
 
-- Overall accuracy (95.3%) is a misleading headline here — at a 3.49% fraud base rate, a model that predicted "not fraud" for everything would already score ~96.5% accuracy. Average precision (0.47) and the per-class report are the metrics that actually matter.
-- The threshold is tuned to be low (4.8%, versus a "default" 50%) because the F2 objective rewards recall: at this threshold the model flags 52% of fraud (recall) at the cost of a 38% precision, i.e. roughly 6 legitimate transactions reviewed for every 10 flagged. That trade-off is intentional given the much higher assumed cost of a missed fraud than a false alarm.
-- `merch_fraud_rate_30d` — one of the engineered Feast features (merchant-level rolling fraud rate), not a raw Kaggle column — ranks in the top 10 by importance, alongside the dataset's anonymized `V`/`card` columns. That is a useful sanity check that the velocity/merchant-risk feature engineering in `ingest/build_features.py` and `feature_repo/features.py` is actually contributing signal, not just along for the ride.
+- At this ~3.5% fraud base rate, average precision (0.47) and the per-class report are more informative than overall accuracy.
+- The threshold is tuned low (4.8%) on purpose: the F2 objective favors recall, so the model catches about half of all fraud (52% recall) at a precision of 38% — a trade-off chosen deliberately, since the assumed cost of missing a fraud case is far higher than the cost of reviewing a false alarm.
+- `merch_fraud_rate_30d` — one of the engineered Feast features (merchant-level rolling fraud rate), not a raw Kaggle column — ranks in the top 10 by importance, alongside the dataset's anonymized `V`/`card` columns. That's a good sign that the velocity/merchant-risk feature engineering in `ingest/build_features.py` and `feature_repo/features.py` is contributing real signal.
 - `search_train_rows` / `search_validation_rows` describe the grid search's internal, throwaway chronological holdout (carved out of the training split only); they are separate from — and smaller than — the project's real validation/test splits that the reported test metrics above come from.
 
 ## Demo console: scoring + cost-weighted drift review
