@@ -11,7 +11,7 @@ WORKDIR /app
 
 COPY --from=builder /root/.local /root/.local
 COPY app/ ./app/
-COPY config/env.py ./config/env.py
+COPY config/ ./config/
 COPY demo/ ./demo/
 COPY gcp/ ./gcp/
 COPY ingest/ ./ingest/

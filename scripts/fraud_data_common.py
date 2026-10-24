@@ -12,9 +12,10 @@ from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
 
-DEFAULT_TRANSACTION_PATH = Path("../dataset/train_transaction.csv")
-DEFAULT_IDENTITY_PATH = Path("../dataset/train_identity.csv")
-DEFAULT_OUTPUT_ROOT = Path("../outputs")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TRANSACTION_PATH = REPO_ROOT / "dataset" / "train_transaction.csv"
+DEFAULT_IDENTITY_PATH = REPO_ROOT / "dataset" / "train_identity.csv"
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs"
 TRANSACTION_START_SQL = "2017-12-01 00:00:00"
 # IEEE-CIS uses TransactionDT as seconds since an arbitrary reference point,
 # not as a real wall-clock timestamp. We derive a synthetic event timestamp

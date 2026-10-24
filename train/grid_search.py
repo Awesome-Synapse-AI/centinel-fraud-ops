@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from config.env import load_repo_env
+from config.category_encoders import category_mapping_sha256, load_category_mappings
 from train.dataset import describe_split, prepare_xy, time_based_split
 from train.modeling import (
     calibrate_classifier,
@@ -27,6 +28,7 @@ from train.modeling import (
     summarize_split_distributions,
     train_xgb_classifier,
 )
+from train.preflight import validate_bigquery_feature_table, verify_historical_feature_sample
 from train.train import _feature_refs_from_service, load_entity_spine
 
 
@@ -63,12 +65,20 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("MLFLOW_EXPERIMENT_NAME", "fraud-xgboost-grid-search"),
         help="MLflow experiment name.",
     )
+    parser.add_argument(
+        "--categorical-mappings",
+        type=Path,
+        default=REPO_ROOT / "outputs" / "preprocessing-contract-v1" / "prepared" / "categorical_mappings.json",
+        help="Persisted category mappings used to generate the Feast table.",
+    )
+    parser.add_argument("--preflight-sample-rows", type=int, default=32)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     load_repo_env()
+    categorical_mappings = load_category_mappings(args.categorical_mappings)
     tracking_uri = os.getenv(
         "MLFLOW_TRACKING_URI",
         f"sqlite:///{(REPO_ROOT / 'outputs' / 'mlflow.db').as_posix()}",
@@ -82,6 +92,17 @@ def main() -> None:
     store = FeatureStore(repo_path=str(args.feature_repo.resolve()))
     service = store.get_feature_service(args.feature_service)
     feature_refs = _feature_refs_from_service(service)
+    validate_bigquery_feature_table(
+        table_ref, feature_refs, category_mapping_sha256(categorical_mappings)
+    )
+    sample_count = verify_historical_feature_sample(
+        store,
+        table_ref,
+        feature_refs,
+        sample_rows=args.preflight_sample_rows,
+    )
+    print(f"preflight_schema=ok table={table_ref}")
+    print(f"preflight_feast_historical_sample_rows={sample_count}")
     entity_df = load_entity_spine(table_ref)
     df = store.get_historical_features(entity_df=entity_df, features=feature_refs).to_df()
 
@@ -124,7 +145,14 @@ def main() -> None:
         results_path = args.results or args.output.with_suffix(".grid-search.csv")
         results_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(search["results"]).to_csv(results_path, index=False)
-        save_bundle(args.output, calibrated, list(x_train.columns), metrics, feature_importance(model, list(x_train.columns)))
+        save_bundle(
+            args.output,
+            calibrated,
+            list(x_train.columns),
+            metrics,
+            feature_importance(model, list(x_train.columns)),
+            categorical_mappings=categorical_mappings,
+        )
         mlflow.log_params({f"best_{key}": value for key, value in best_params.items()})
         for key, value in metrics.items():
             if isinstance(value, (int, float)) and value is not None:

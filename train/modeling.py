@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from config.category_encoders import category_mapping_sha256
 import sys
 import threading
 import time
@@ -319,6 +320,7 @@ def save_bundle(
     feature_names: list[str],
     metrics: dict[str, float | None | dict],
     importance: dict[str, float],
+    categorical_mappings: dict | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     bundle = {
@@ -328,6 +330,8 @@ def save_bundle(
         "val_threshold": float(metrics.get("val_threshold", 0.5)),
         "metrics": metrics,
         "importance": importance,
+        "categorical_mappings": categorical_mappings or {},
+        "category_mapping_sha256": category_mapping_sha256(categorical_mappings or {}),
     }
     joblib.dump(bundle, output_path)
 

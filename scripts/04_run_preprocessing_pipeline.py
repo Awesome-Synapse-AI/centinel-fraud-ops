@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -7,6 +8,12 @@ from pyspark.ml import Pipeline
 from pyspark.ml.feature import StringIndexer
 from pyspark.sql import DataFrame, functions as F
 from pyspark.sql import types as T
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from config.model_schema import CATEGORICAL_RAW_FEATURE_NAMES, PREPROCESS_REQUIRED_COLUMNS
 
 from fraud_data_common import (
     DEFAULT_OUTPUT_ROOT,
@@ -48,13 +55,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test-transaction-csv",
         type=Path,
-        default=Path("../dataset/test_transaction.csv"),
+        default=REPO_ROOT / "dataset" / "test_transaction.csv",
         help="Test transaction CSV used for final schema-aligned test-set preparation.",
     )
     parser.add_argument(
         "--test-identity-csv",
         type=Path,
-        default=Path("../dataset/test_identity.csv"),
+        default=REPO_ROOT / "dataset" / "test_identity.csv",
         help="Test identity CSV used for final schema-aligned test-set preparation.",
     )
     parser.add_argument(
@@ -148,6 +155,7 @@ def run_step1(args: argparse.Namespace, spark, output_csv: Path, reports_dir: Pa
         row["column"]
         for row in missing_records
         if row["missing_percent"] > args.drop_column_missing_threshold
+        and row["column"] not in PREPROCESS_REQUIRED_COLUMNS
     ]
     working_df = df.drop(*columns_to_drop) if columns_to_drop else df
     # working_df feeds the per-label report, the row-missing filter, the
@@ -202,11 +210,8 @@ def run_step1(args: argparse.Namespace, spark, output_csv: Path, reports_dir: Pa
         reports_dir / "missing_values_by_isFraud.csv",
     )
 
-    row_has_missing = None
-    for column in working_df.columns:
-        condition = is_missing_expr(working_df, column)
-        row_has_missing = condition if row_has_missing is None else (row_has_missing | condition)
-
+    missing_checks = [is_missing_expr(working_df, column) for column in working_df.columns]
+    row_has_missing = F.array_contains(F.array(*missing_checks), F.lit(True)) if missing_checks else None
     rows_with_missing = working_df.filter(row_has_missing).count() if row_has_missing is not None else 0
     row_missing_percent = (rows_with_missing / total_rows * 100) if total_rows else 0.0
 
@@ -324,9 +329,15 @@ def run_step2(args: argparse.Namespace, spark, input_csv: Path, output_csv: Path
         feature_b = row["feature_b"]
         if feature_a in to_drop or feature_b in to_drop:
             continue
+        if feature_a in PREPROCESS_REQUIRED_COLUMNS and feature_b in PREPROCESS_REQUIRED_COLUMNS:
+            continue
         a_label_corr = label_corr.get(feature_a, 0.0)
         b_label_corr = label_corr.get(feature_b, 0.0)
-        if a_label_corr >= b_label_corr:
+        if feature_a in PREPROCESS_REQUIRED_COLUMNS:
+            kept_feature, removed_feature = feature_a, feature_b
+        elif feature_b in PREPROCESS_REQUIRED_COLUMNS:
+            kept_feature, removed_feature = feature_b, feature_a
+        elif a_label_corr >= b_label_corr:
             kept_feature, removed_feature = feature_a, feature_b
         else:
             kept_feature, removed_feature = feature_b, feature_a
@@ -392,7 +403,11 @@ def run_step3(args: argparse.Namespace, spark, input_csv: Path, output_csv: Path
         reports_dir / "feature_label_correlations.csv",
     )
 
-    to_drop = [row["feature"] for row in label_rows if row["decision"] == "remove"]
+    to_drop = [
+        row["feature"]
+        for row in label_rows
+        if row["decision"] == "remove" and row["feature"] not in PREPROCESS_REQUIRED_COLUMNS
+    ]
     write_single_csv(df.drop(*to_drop), output_csv)
     df.unpersist()
 
@@ -454,11 +469,13 @@ def prepare_final_datasets(
         for field in train_stage3.schema.fields
         if isinstance(field.dataType, numeric_types) and field.name != "isFraud"
     ]
-    categorical_feature_columns = [
-        field.name
-        for field in train_stage3.schema.fields
-        if isinstance(field.dataType, T.StringType) and field.name not in {"ts", "transaction_date"}
-    ]
+    categorical_feature_columns = list(CATEGORICAL_RAW_FEATURE_NAMES)
+    missing_categorical = set(categorical_feature_columns).difference(train_stage3.columns)
+    if missing_categorical:
+        raise ValueError(
+            "Preprocessing output is missing categorical columns required by the model contract: "
+            f"{sorted(missing_categorical)}"
+        )
 
     train_model_input = train_stage3
     test_base = _build_test_base_dataset(
@@ -472,6 +489,9 @@ def prepare_final_datasets(
 
     if categorical_feature_columns:
         train_model_input = train_model_input.fillna("__MISSING__", subset=categorical_feature_columns)
+        for column in categorical_feature_columns:
+            if column not in test_model_input.columns:
+                test_model_input = test_model_input.withColumn(column, F.lit("__MISSING__"))
         test_fill_columns = [column for column in categorical_feature_columns if column in test_model_input.columns]
         if test_fill_columns:
             test_model_input = test_model_input.fillna("__MISSING__", subset=test_fill_columns)
@@ -488,6 +508,25 @@ def prepare_final_datasets(
             ]
         )
         pipeline_model = pipeline.fit(train_model_input)
+        categorical_mappings = {
+            column: {
+                "values": [str(value) for value in stage.labels],
+                "unknown_value": len(stage.labels),
+            }
+            for column, stage in zip(categorical_feature_columns, pipeline_model.stages)
+        }
+        (final_dir / "categorical_mappings.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "unknown_category": "__UNKNOWN__",
+                    "mappings": categorical_mappings,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         train_stage3 = pipeline_model.transform(train_model_input)
         test_base = pipeline_model.transform(test_model_input)
     else:

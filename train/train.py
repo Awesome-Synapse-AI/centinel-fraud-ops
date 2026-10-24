@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from config.env import load_repo_env
+from config.category_encoders import category_mapping_sha256, load_category_mappings
 from train.dataset import describe_split, prepare_xy, time_based_split
 from train.modeling import (
     calibrate_classifier,
@@ -22,6 +23,7 @@ from train.modeling import (
     summarize_split_distributions,
     train_xgb_classifier,
 )
+from train.preflight import validate_bigquery_feature_table, verify_historical_feature_sample
 
 
 def log_step(message: str) -> None:
@@ -65,6 +67,13 @@ def parse_args() -> argparse.Namespace:
         help="Beta used to tune the decision threshold on validation data.",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--categorical-mappings",
+        type=Path,
+        default=REPO_ROOT / "outputs" / "preprocessing-contract-v1" / "prepared" / "categorical_mappings.json",
+        help="Persisted category mappings used to generate the Feast table.",
+    )
+    parser.add_argument("--preflight-sample-rows", type=int, default=32)
     return parser.parse_args()
 
 
@@ -114,6 +123,7 @@ def main() -> None:
     with timed_step("Loading repository environment"):
         load_repo_env()
     args = parse_args()
+    categorical_mappings = load_category_mappings(args.categorical_mappings)
     table_ref = os.environ["FEAST_BIGQUERY_TABLE"]
     with timed_step("Initializing Feast feature store"):
         store = FeatureStore(repo_path=str(args.feature_repo.resolve()))
@@ -121,6 +131,17 @@ def main() -> None:
         service = store.get_feature_service(args.feature_service)
         feature_refs = _feature_refs_from_service(service)
     log_step(f"Using Feast features: {feature_refs}")
+    with timed_step(f"Checking BigQuery schema and fetching a {args.preflight_sample_rows}-row Feast sample"):
+        validate_bigquery_feature_table(
+            table_ref, feature_refs, category_mapping_sha256(categorical_mappings)
+        )
+        sample_count = verify_historical_feature_sample(
+            store,
+            table_ref,
+            feature_refs,
+            sample_rows=args.preflight_sample_rows,
+        )
+    log_step(f"Feature preflight passed; Feast returned {sample_count} rows")
     with timed_step(f"Loading entity spine from BigQuery table {table_ref}"):
         entity_df = load_entity_spine(table_ref)
     with timed_step("Fetching historical features from Feast"):
@@ -158,7 +179,14 @@ def main() -> None:
     with timed_step("Computing feature importance"):
         importance = feature_importance(model, list(x_train.columns))
     with timed_step(f"Saving model bundle to {args.output}"):
-        save_bundle(args.output, calibrated, list(x_train.columns), metrics, importance)
+        save_bundle(
+            args.output,
+            calibrated,
+            list(x_train.columns),
+            metrics,
+            importance,
+            categorical_mappings=categorical_mappings,
+        )
 
     log_step(f"Saved model bundle to {args.output}")
     for key, value in metrics.items():
